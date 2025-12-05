@@ -13,7 +13,7 @@
 `domain_dns_audit` ist ein leistungsfähiges DNS-Audit-Tool zur automatisierten Prüfung von Mail-Domain-Konfigurationen.  
 Es analysiert **MX, SPF, DMARC und DKIM**, wendet **regelbasierte Profile** an und erzeugt einen strukturierten **JSON-Report** für Monitoring-Systeme, Security-Audits oder Mail-Migrationsprojekte.
 
-### ✨ Hauptfunktionen
+### Hauptfunktionen
 
 - **MX-Analyse** mit Profilen & Gruppen (mehrere MX-Layouts möglich)  
 - **SPF-Analyse** inkl. Modusbewertung (hard, soft, neutral, open, none)  
@@ -32,7 +32,7 @@ Es analysiert **MX, SPF, DMARC und DKIM**, wendet **regelbasierte Profile** an u
 
 ---
 
-## 📦 Dokumentation
+## Dokumentation
 
 - **Konfigurationshandbuch**  
   👉 [`domain_dns_config_README.md`](./domain_dns_config_README.md)
@@ -42,7 +42,7 @@ Es analysiert **MX, SPF, DMARC und DKIM**, wendet **regelbasierte Profile** an u
 
 ---
 
-## 🚀 Kurzes Beispiel
+## Kurzes Beispiel
 
 ```bash
 perl domain_dns_audit.pl --config ./domain_dns_audit.json
@@ -56,7 +56,7 @@ JSON-Output liegt danach unter:
 
 ---
 
-## 🔧 Typische Anwendungsfälle
+## Typische Anwendungsfälle
 
 - E-Mail Security Audits (MX/SPF/DMARC/DKIM)
 - Vorbereitung oder Kontrolle von DMARC-Rollouts
@@ -66,6 +66,6 @@ JSON-Output liegt danach unter:
 
 ---
 
-## 📄 Lizenz
+## Lizenz
 
 MIT License (siehe LICENSE)
