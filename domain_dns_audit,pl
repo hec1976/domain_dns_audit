@@ -1,0 +1,1205 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use utf8;
+use open qw(:std :utf8);
+
+use Net::LDAP;
+use Net::LDAP::Util qw(ldap_error_text);
+use Net::DNS;
+use JSON::MaybeXS qw(encode_json decode_json);
+use Log::Log4perl;
+use POSIX qw(strftime);
+use FindBin;
+use File::Spec;
+use Getopt::Long;
+use Domain::PublicSuffix;
+
+# =========================
+# Konstanten
+# =========================
+
+my $SCRIPT_DIR     = $FindBin::Bin;
+my $DEFAULT_CONFIG = File::Spec->catfile($SCRIPT_DIR, 'domain_dns_audit.json');
+
+# =========================
+# CLI-Optionen
+# =========================
+
+my $opt_config;
+my $opt_debug  = 0;
+my $opt_domain;
+my $opt_help   = 0;
+
+GetOptions(
+    'config=s' => \$opt_config,   # Pfad zur JSON-Config
+    'debug'    => \$opt_debug,    # Debug-Logging aktivieren
+    'domain=s' => \$opt_domain,   # Nur eine Domain prüfen
+    'help'     => \$opt_help,     # Hilfe anzeigen
+) or die "Fehler beim Parsen der Optionen. Verwende --help für Hilfe.\n";
+
+if ($opt_help) {
+    print <<"USAGE";
+Verwendung: $0 [--config FILE] [--domain DOMAIN] [--debug]
+
+Optionen:
+  --config FILE    Pfad zur JSON-Konfiguration (Default: $DEFAULT_CONFIG)
+  --domain DOMAIN  Nur diese eine Domain prüfen (LDAP/extra_domains werden ignoriert)
+  --debug          Log-Level DEBUG aktivieren
+  --help           Diese Hilfe anzeigen
+
+Beispiele:
+  $0
+  $0 --config /etc/mmbb/domain_dns_audit.json
+  $0 --domain example.ch --debug
+USAGE
+    exit 0;
+}
+
+# =========================
+# Konfiguration laden (JSON)
+# =========================
+
+my $config_file = $opt_config // $DEFAULT_CONFIG;
+
+open my $cfh, '<:utf8', $config_file
+  or die "Kann Config nicht öffnen: $config_file: $!";
+
+local $/;
+my $config_json = <$cfh>;
+close $cfh;
+
+my $conf = eval { decode_json($config_json) };
+die "Fehler beim Parsen der JSON-Config $config_file: $@" if $@;
+die "Config $config_file ist kein JSON-Objekt\n" unless ref $conf eq 'HASH';
+
+my $ldap_conf   = $conf->{ldap}    || {};
+my $check_conf  = $conf->{check}   || {};
+my $out_conf    = $conf->{output}  || {};
+my $dns_conf    = $conf->{dns}     || {};
+my $dom_conf    = $conf->{domains} || {};
+
+my $LOG_FILE  = $out_conf->{log_file}  || "/var/log/mmbb/domain_dns_audit.log";
+my $JSON_FILE = $out_conf->{json_file} || "/var/log/mmbb/domain_dns_audit.json";
+my $LOG_LEVEL = $out_conf->{log_level} || "INFO";
+
+# CLI-Override: --debug setzt Log-Level auf DEBUG
+if ($opt_debug) {
+    $LOG_LEVEL = "DEBUG";
+}
+
+# LDAP optional
+my $LDAP_ENABLED;
+if (exists $ldap_conf->{enabled}) {
+    $LDAP_ENABLED = $ldap_conf->{enabled} ? 1 : 0;
+} else {
+    $LDAP_ENABLED = $ldap_conf->{uri} ? 1 : 0;
+}
+
+# Initialisiere das Objekt EINMAL global, nicht in der Loop
+my $suffix_handler = Domain::PublicSuffix->new();
+
+
+# =========================
+# Helper: Wert als Liste
+# =========================
+
+sub _as_list {
+    my ($val) = @_;
+    return () unless defined $val;
+    if (ref $val eq 'ARRAY') {
+        return map { defined $_ ? $_ : () } @$val;
+    } else {
+        return map { s/^\s+|\s+$//gr } split /,/, $val;
+    }
+}
+
+# =========================
+# Globale Defaults (nur Fallback, Profile überschreiben)
+# =========================
+
+my $GLOBAL_REQUIRE_SPF  = exists $check_conf->{require_spf}
+    ? ($check_conf->{require_spf} ? 1 : 0)
+    : 1;
+
+my $GLOBAL_REQUIRE_DKIM = exists $check_conf->{require_dkim}
+    ? ($check_conf->{require_dkim} ? 1 : 0)
+    : 1;
+
+my @GLOBAL_DMARC_OK_POL  = _as_list($check_conf->{dmarc_ok_policies});
+@GLOBAL_DMARC_OK_POL     = ("reject", "quarantine") unless @GLOBAL_DMARC_OK_POL;
+
+my @GLOBAL_DKIM_SELECTORS             = _as_list($check_conf->{dkim_selectors});
+my @GLOBAL_DKIM_TXT_REQUIRED_CONTAINS = _as_list($check_conf->{dkim_txt_required_contains});
+
+# DNS Server
+my @DNS_SERVERS = _as_list($dns_conf->{servers});
+
+# Domains aus Config
+my @EXTRA_DOMAINS   = map { lc $_ } _as_list($dom_conf->{extra_domains});
+my @EXCLUDE_DOMAINS = map { lc $_ } _as_list($dom_conf->{exclude_domains});
+
+# Profile-Katalog
+my $PROFILE_CONF = $check_conf->{profiles} || {};
+
+# =========================
+# Logging
+# =========================
+
+my $log_conf = qq(
+log4perl.logger                    = $LOG_LEVEL, LOGFILE
+log4perl.appender.LOGFILE          = Log::Log4perl::Appender::File
+log4perl.appender.LOGFILE.filename = $LOG_FILE
+log4perl.appender.LOGFILE.layout   = Log::Log4perl::Layout::PatternLayout
+log4perl.appender.LOGFILE.layout.ConversionPattern = %d [%p] %m%n
+);
+
+Log::Log4perl::init(\$log_conf);
+my $log = Log::Log4perl->get_logger();
+
+$log->info("Start domain_dns_audit mit Config $config_file");
+$log->info("LDAP_ENABLED = $LDAP_ENABLED");
+$log->info("CLI: debug=$opt_debug, domain=" . ($opt_domain // '')) if $opt_debug;
+
+# =========================
+# DNS Resolver
+# =========================
+
+my %resolver_opts = (
+    retry       => 2,
+    udp_timeout => 2,
+    tcp_timeout => 4,
+);
+
+if (@DNS_SERVERS) {
+    $resolver_opts{nameservers} = \@DNS_SERVERS;
+    $log->info("Nutze DNS Server: " . join(", ", @DNS_SERVERS));
+} else {
+    $log->info("Nutze System DNS Resolver");
+}
+
+my $resolver = Net::DNS::Resolver->new(%resolver_opts);
+
+# =========================
+# Hilfsfunktionen
+# =========================
+
+sub fetch_domains_from_ldap {
+    my $uri         = $ldap_conf->{uri}        || die "ldap.uri fehlt in Config\n";
+    my $bind_dn     = $ldap_conf->{bind_dn}    || "";
+    my $bind_pw     = $ldap_conf->{bind_pw}    || "";
+    my $base_dn     = $ldap_conf->{base_dn}    || die "ldap.base_dn fehlt in Config\n";
+    my $filter      = $ldap_conf->{filter}     || "(objectClass=*)";
+    my $attr_domain = $ldap_conf->{attr_domain}|| "associatedDomain";
+
+    $log->info("Verbinde LDAP: $uri, BaseDN=$base_dn, Filter=$filter, Attr=$attr_domain");
+
+    my $ldap = Net::LDAP->new($uri, timeout => 10);
+    die "LDAP Verbindung fehlgeschlagen: $@" unless $ldap;
+
+    my $mesg;
+    if ($bind_dn) {
+        $mesg = $ldap->bind($bind_dn, password => $bind_pw);
+    } else {
+        $mesg = $ldap->bind;
+    }
+    if ($mesg->code) {
+        die "LDAP Bind Fehler: " . ldap_error_text($mesg->code) . "\n";
+    }
+
+    $mesg = $ldap->search(
+        base   => $base_dn,
+        scope  => 'sub',
+        filter => $filter,
+        attrs  => [$attr_domain],
+    );
+
+    if ($mesg->code) {
+        die "LDAP Suche Fehler: " . ldap_error_text($mesg->code) . "\n";
+    }
+
+    my %domains;
+    foreach my $entry ($mesg->entries) {
+        my @vals = $entry->get_value($attr_domain);
+        for my $d (@vals) {
+            next unless defined $d;
+            $d =~ s/^\s+|\s+$//g;
+            next unless $d;
+            $d = lc $d;
+            $domains{$d} = 1;
+        }
+    }
+
+    $ldap->unbind;
+
+    my @dom_list = sort keys %domains;
+    $log->info("LDAP Domains gefunden: " . scalar(@dom_list));
+    return @dom_list;
+}
+
+sub get_txt_records {
+    my ($name) = @_;
+    my $pkt = $resolver->query($name, "TXT");
+    return () unless $pkt;
+    my @txt;
+    foreach my $rr ($pkt->answer) {
+        next unless $rr->type eq "TXT";
+        push @txt, $rr->txtdata;
+    }
+    return @txt;
+}
+
+sub get_txt_records_with_cname {
+    my ($name) = @_;
+
+    my @txt = get_txt_records($name);
+    if (@txt) {
+        return {
+            txt          => \@txt,
+            cname_used   => 0,
+            cname_target => undef,
+        };
+    }
+
+    my $pkt = $resolver->query($name, "CNAME");
+    return {
+        txt          => [],
+        cname_used   => 0,
+        cname_target => undef,
+    } unless $pkt;
+
+    my ($cname_rr) = grep { $_->type eq 'CNAME' } $pkt->answer;
+    return {
+        txt          => [],
+        cname_used   => 0,
+        cname_target => undef,
+    } unless $cname_rr;
+
+    my $target = $cname_rr->cname;
+    my @txt2 = get_txt_records($target);
+
+    return {
+        txt          => \@txt2,
+        cname_used   => 1,
+        cname_target => $target,
+    };
+}
+
+sub spf_mode_rank {
+    my ($mode) = @_;
+    return 4 if $mode eq 'hard';     # -all
+    return 3 if $mode eq 'soft';     # ~all
+    return 2 if $mode eq 'neutral';  # ?all
+    return 2 if $mode eq 'no-all';   # v=spf1 ohne all
+    return 1 if $mode eq 'open';     # all oder +all
+    return 0 if $mode eq 'none';     # kein SPF
+    return 0;
+}
+
+# Organisations-Domain 
+sub org_domain {
+    my ($dom) = @_;
+    return undef unless defined $dom;
+    
+    # Versuche die Root-Domain via PublicSuffix zu holen
+    # Das behandelt .co.uk, .com, .ch korrekt
+    my $root = $suffix_handler->get_root_domain($dom);
+    
+    if (defined $root) {
+        return $root;
+    }
+    
+    # Fallback, falls die Domain in der Liste nicht existiert (z.B. internes Netz)
+    # Alte "letzte 2 Teile"-Logik
+    my @p = split /\./, $dom;
+    return join('.', @p[-2, -1]) if @p >= 2;
+    return $dom;
+}
+
+# =========================
+# MX Check mit Profilgruppen
+# =========================
+
+sub check_mx {
+    my ($domain, $mx_policy) = @_;
+
+    my $pkt = $resolver->query($domain, "MX");
+    my @mx_hosts;
+
+    if ($pkt) {
+        foreach my $rr ($pkt->answer) {
+            next unless $rr->type eq "MX";
+            push @mx_hosts, {
+                exchange   => lc($rr->exchange),
+                preference => $rr->preference,
+            };
+        }
+    }
+
+    my @actual_names = map { $_->{exchange} } @mx_hosts;
+    my $groups_conf  = $mx_policy->{groups} || [];
+    my @groups       = ref $groups_conf eq 'ARRAY' ? @$groups_conf : ();
+
+    if (!@mx_hosts) {
+        return {
+            status => "fail",
+            detail => "Keine MX Records gefunden",
+            mx     => \@mx_hosts,
+            groups => \@groups,
+        };
+    }
+
+    if (!@groups) {
+        return {
+            status => "ok",
+            detail => "MX Records gefunden: " . join(", ", @actual_names),
+            mx     => \@mx_hosts,
+            groups => [],
+        };
+    }
+
+    my $overall_status = "fail";
+    my @group_results;
+
+    for my $g (@groups) {
+        my @req = map { lc $_ } _as_list($g->{mx_required});
+        my $allow_others = exists $g->{mx_allow_others} ? ($g->{mx_allow_others} ? 1 : 0) : 1;
+
+        my %actual_set   = map { $_ => 1 } @actual_names;
+        my %required_set = map { $_ => 1 } @req;
+
+        my @missing;
+        my @unexpected;
+
+        for my $r (@req) {
+            push @missing, $r unless $actual_set{$r};
+        }
+
+        if (@req) {
+            for my $a (@actual_names) {
+                push @unexpected, $a unless $required_set{$a};
+            }
+        }
+
+        my $st = "ok";
+        my @parts;
+
+        push @parts, "MX Records: " . join(", ", @actual_names);
+
+        if (@missing) {
+            $st = "fail";
+            push @parts, "fehlende MX: " . join(", ", @missing);
+        }
+
+        if (@unexpected) {
+            if ($allow_others) {
+                push @parts, "zusätzliche MX erlaubt: " . join(", ", @unexpected);
+            } else {
+                $st = "fail";
+                push @parts, "unerwartete MX: " . join(", ", @unexpected);
+            }
+        }
+
+        push @group_results, {
+            name             => $g->{name} // '',
+            status           => $st,
+            mx_required      => \@req,
+            missing_required => \@missing,
+            unexpected       => \@unexpected,
+            mx_allow_others  => $allow_others + 0,
+            detail           => join("; ", @parts),
+        };
+
+        if ($st eq 'ok' && $overall_status ne 'ok') {
+            $overall_status = 'ok';
+        }
+    }
+
+    my $detail = $overall_status eq 'ok'
+        ? "MX Konfiguration entspricht mindestens einem Profil"
+        : "Keine MX Profilgruppe wurde vollständig erfüllt";
+
+    return {
+        status => $overall_status,
+        detail => $detail,
+        mx     => \@mx_hosts,
+        groups => \@group_results,
+    };
+}
+
+# =========================
+# SPF Check (pro Profil)
+# =========================
+
+sub check_spf {
+    my ($domain, $profile) = @_;
+
+    my $spf_policy  = $profile->{spf_policy} || {};
+    my $require_spf = exists $profile->{require_spf}
+        ? ($profile->{require_spf} ? 1 : 0)
+        : $GLOBAL_REQUIRE_SPF;
+
+    my $name = $domain;
+
+    my @txt = get_txt_records($name);
+    my @spf_all = grep { /^v=spf1\s/i } @txt;
+
+    my $spf_orig      = @spf_all ? $spf_all[0] : "";
+    my $spf_effective = $spf_orig;
+    my $redirect_used = 0;
+    my $redirect_target;
+    my @spf_redirect;
+
+    my $mode;
+    my $has_all = 0;
+    my $multiple_spf_records = @spf_all > 1 ? 1 : 0;
+
+    if (!@spf_all) {
+        $mode = "none";
+    } else {
+        if ($spf_orig =~ /\bredirect=([^ \t;]+)/i) {
+            $redirect_used   = 1;
+            $redirect_target = $1;
+
+            my @txt2 = get_txt_records($redirect_target);
+            @spf_redirect = grep { /^v=spf1\s/i } @txt2;
+
+            if (@spf_redirect) {
+                $spf_effective = $spf_redirect[0];
+            }
+        }
+
+        if ($spf_effective =~ /-all\b/i) {
+            $mode    = "hard";
+            $has_all = 1;
+        } elsif ($spf_effective =~ /~all\b/i) {
+            $mode    = "soft";
+            $has_all = 1;
+        } elsif ($spf_effective =~ /\?all\b/i) {
+            $mode    = "neutral";
+            $has_all = 1;
+        } elsif ($spf_effective =~ /\ball\b/i) {
+            $mode    = "open";
+            $has_all = 1;
+        } else {
+            $mode    = "no-all";
+            $has_all = 0;
+        }
+    }
+
+    my $combined = @spf_all ? join(" ", @spf_all) : ($spf_effective || $spf_orig || "");
+
+    my $groups_conf   = $spf_policy->{groups}   || {};
+    my $defaults_conf = $spf_policy->{defaults} || {};
+    my @groups        = ref $groups_conf eq 'ARRAY' ? @$groups_conf : ();
+
+    my $status;
+    my $detail;
+    my @group_results;
+
+    if (!@spf_all && !@groups) {
+        if ($require_spf) {
+            $status = "fail";
+            $detail = "Kein SPF Record vorhanden (require_spf=1)";
+        } else {
+            $status = "warn";
+            $detail = "Kein SPF Record vorhanden (require_spf=0, nur Warnung)";
+        }
+
+        return {
+            status               => $status,
+            detail               => $detail,
+            require_spf          => $require_spf + 0,
+            raw_original         => \@spf_all,
+            raw_effective        => $spf_effective ? [ $spf_effective ] : [],
+            multiple_spf_records => $multiple_spf_records,
+            redirect_used        => $redirect_used ? 1 : 0,
+            redirect_target      => $redirect_target,
+            redirect_spf         => \@spf_redirect,
+            mode                 => $mode,
+            has_all              => $has_all ? 1 : 0,
+            groups               => [],
+        };
+    }
+
+    if (@groups) {
+        my $overall_status = "fail";
+
+        for my $g (@groups) {
+            my @allowed_modes = _as_list(
+                exists $g->{allowed_modes}
+                    ? $g->{allowed_modes}
+                    : $defaults_conf->{allowed_modes}
+            );
+            my %allowed = map { $_ => 1 } @allowed_modes;
+
+            my @req_parts = _as_list($g->{required_contains});
+
+            my @missing;
+            for my $p (@req_parts) {
+                push @missing, $p unless $combined && index($combined, $p) >= 0;
+            }
+
+            my $gst = "ok";
+            my @notes;
+
+            if (@allowed_modes && !$allowed{$mode}) {
+                $gst = "fail";
+                push @notes, "SPF Modus $mode nicht in erlaubten Modi " . join("/", @allowed_modes);
+            }
+
+            my $forbid_open = exists $g->{forbid_open}
+                ? ($g->{forbid_open} ? 1 : 0)
+                : ($defaults_conf->{forbid_open} ? 1 : 0);
+
+            if ($mode eq 'open' && $forbid_open) {
+                $gst = "fail";
+                push @notes, "Modus open durch Profil verboten";
+            }
+
+            if (@missing) {
+                $gst = "fail";
+                push @notes, "fehlende SPF Pflichtteile: " . join(", ", @missing);
+            }
+
+            push @group_results, {
+                name                   => $g->{name} // '',
+                status                 => $gst,
+                allowed_modes          => \@allowed_modes,
+                required_contains      => \@req_parts,
+                missing_required_parts => \@missing,
+                detail                 => @notes ? join("; ", @notes) : "SPF Gruppe erfüllt",
+            };
+
+            if ($gst eq 'ok' && $overall_status ne 'ok') {
+                $overall_status = 'ok';
+            }
+        }
+
+        $status = $overall_status;
+        if ($status eq 'ok') {
+            $detail = "SPF entspricht mindestens einer Profilgruppe (Modus $mode)";
+        } else {
+            $detail = "SPF entspricht keiner Profilgruppe (Modus $mode)";
+        }
+
+    } else {
+        my $forbid_open = $defaults_conf->{forbid_open} ? 1 : 0;
+
+        if (!@spf_all) {
+            if ($require_spf) {
+                $status = "fail";
+                $detail = "Kein SPF Record vorhanden (require_spf=1)";
+            } else {
+                $status = "warn";
+                $detail = "Kein SPF Record vorhanden (require_spf=0, nur Warnung)";
+            }
+        } else {
+            if ($mode eq 'open' && $forbid_open) {
+                $status = "fail";
+                $detail = "SPF Modus open ist durch Profil verboten";
+            } else {
+                $status = "ok";
+                $detail = "SPF Record vorhanden (Modus $mode)";
+            }
+        }
+    }
+
+    return {
+        status               => $status,
+        detail               => $detail,
+        require_spf          => $require_spf + 0,
+        raw_original         => \@spf_all,
+        raw_effective        => $spf_effective ? [ $spf_effective ] : [],
+        multiple_spf_records => $multiple_spf_records,
+        redirect_used        => $redirect_used ? 1 : 0,
+        redirect_target      => $redirect_target,
+        redirect_spf         => \@spf_redirect,
+        mode                 => $mode,
+        has_all              => $has_all ? 1 : 0,
+        groups               => \@group_results,
+    };
+}
+
+# =========================
+# DMARC mit RUA Analyse (pro Profil)
+# =========================
+
+sub parse_dmarc_tag {
+    my ($tagstr) = @_;
+    my %tags;
+    for my $p (split /;/, $tagstr) {
+        $p =~ s/^\s+|\s+$//g;
+        next unless $p;
+        my ($k, $v) = split /=/, $p, 2;
+        next unless defined $k and defined $v;
+        $k =~ s/^\s+|\s+$//g;
+        $v =~ s/^\s+|\s+$//g;
+        $tags{lc $k} = $v;
+    }
+    return %tags;
+}
+
+sub extract_domain_from_mailto {
+    my ($uri) = @_;
+    return undef unless $uri;
+    $uri =~ s/^\s+|\s+$//g;
+    return undef unless $uri =~ /^mailto:/i;
+    my ($addr) = $uri =~ /^mailto:([^?]+)/i;
+    return undef unless $addr && $addr =~ /\@/;
+    my (undef, $dom) = split /\@/, $addr, 2;
+    $dom = lc $dom if defined $dom;
+    return $dom;
+}
+
+sub check_external_dmarc_authorization {
+    my ($domain, $provider_domain) = @_;
+    my $name = $domain . "._report._dmarc." . $provider_domain;
+    my @txt = get_txt_records($name);
+
+    my $authorized = 0;
+    for my $t (@txt) {
+        if ($t =~ /v=DMARC1/i) {
+            $authorized = 1;
+            last;    # korrekt in Perl
+        }
+    }
+
+    return {
+        fqdn        => $name,
+        authorized  => $authorized ? 1 : 0,
+        txt_records => \@txt,
+    };
+}
+
+
+sub check_dmarc {
+    my ($domain, $profile) = @_;
+
+    my $dmarc_policy = $profile->{dmarc_policy} || {};
+
+    my @ok_policies = _as_list($dmarc_policy->{ok_policies});
+    @ok_policies = _as_list($profile->{dmarc_ok_policies}) unless @ok_policies;
+    @ok_policies = @GLOBAL_DMARC_OK_POL                     unless @ok_policies;
+
+    # Effektive Domain für DMARC Lookup (kann Parent sein)
+    my $lookup_domain   = $domain;
+    my $inherited_from  = undef;
+
+    # 1. Versuch: _dmarc.<domain>
+    my $name = "_dmarc.$lookup_domain";
+    my @txt  = get_txt_records($name);
+    my @dmarc = grep { /^v=DMARC1/i } @txt;
+
+	# NEUE (RFC-konforme) LOGIK:
+    # 2. Fallback: Organizational Domain, falls kein DMARC auf Subdomain
+    # RFC 7489 Section 6.6.3: Wenn auf der Subdomain nichts gefunden wird, 
+    # muss auf der Organizational Domain gesucht werden.
+    
+    # Wir holen die Org-Domain mit der verbesserten Funktion (via PublicSuffix)
+    my $org_dom = org_domain($domain);
+
+    # Wir prüfen nur, wenn eine Org-Domain gefunden wurde UND wir nicht schon dort sind
+    if (!@dmarc && defined $org_dom && $org_dom ne $domain) {
+        
+        my $parent_name = "_dmarc.$org_dom";
+        my @txt_parent  = get_txt_records($parent_name);
+        my @dmarc_parent = grep { /^v=DMARC1/i } @txt_parent;
+
+        if (@dmarc_parent) {
+            # DMARC wird von der Organizational Domain geerbt
+            $lookup_domain  = $org_dom;
+            $inherited_from = $org_dom;
+            @txt            = @txt_parent;
+            @dmarc          = @dmarc_parent;
+        }
+    }
+
+    if (!@dmarc) {
+        return {
+            status          => "fail",
+            detail          => "Kein DMARC Record gefunden",
+            raw             => \@txt,
+            inherited_from  => undef,
+            effective_domain => $lookup_domain,
+        };
+    }
+
+    my %tags   = parse_dmarc_tag($dmarc[0]);
+    my $policy = lc($tags{p} // "");
+
+    my $policy_ok = 0;
+    for my $pol (@ok_policies) {
+        if ($policy eq $pol) {
+            $policy_ok = 1;
+            last;
+        }
+    }
+
+    my $rua         = $tags{rua} // "";
+    my $require_rua = exists $dmarc_policy->{require_rua}
+        ? ($dmarc_policy->{require_rua} ? 1 : 0)
+        : 1;
+
+    my @rua_raw = split /,/, $rua;
+    my @rua_domains;
+    for my $r (@rua_raw) {
+        my $d = extract_domain_from_mailto($r);
+        push @rua_domains, $d if $d;
+    }
+
+    my @allow_external = map { lc $_ } _as_list($dmarc_policy->{allow_external_rua_domains});
+    my %allow_external = map { $_ => 1 } @allow_external;
+
+    my $require_auth = exists $dmarc_policy->{require_external_authorization}
+        ? ($dmarc_policy->{require_external_authorization} ? 1 : 0)
+        : 0;
+
+    my @local_rua;
+    my @external_domains;
+    my %external_seen;
+
+    # "lokal" anhand Organisationsdomain (lookup_domain vs. RUA-Host)
+    my $org_lookup = org_domain($lookup_domain);
+
+    for my $rd (@rua_domains) {
+        next unless $rd;
+        my $rua_org = org_domain($rd);
+
+        if (defined $rua_org && defined $org_lookup && $rua_org eq $org_lookup) {
+            push @local_rua, $rd;
+        } else {
+            push @external_domains, $rd unless $external_seen{$rd}++;
+        }
+    }
+
+    my @external_details;
+    my @external_allowed;
+    my @external_unapproved;
+
+    for my $ext (@external_domains) {
+        # Autorisierung bezieht sich auf die effektive DMARC Domain
+        my $auth_info = check_external_dmarc_authorization($lookup_domain, $ext);
+        my $in_allow  = $allow_external{$ext} ? 1 : 0;
+
+        push @external_details, {
+            domain              => $ext,
+            in_allowlist        => $in_allow,
+            authorized_via_dns  => $auth_info->{authorized},
+            auth_fqdn           => $auth_info->{fqdn},
+            auth_txt            => $auth_info->{txt_records},
+        };
+
+        if ($in_allow) {
+            push @external_allowed, $ext;
+        } else {
+            push @external_unapproved, $ext;
+        }
+    }
+
+    my $status = "ok";
+    my @notes;
+
+    if (!$policy_ok) {
+        $status = "warn";
+        push @notes, "DMARC Policy ist nicht streng (" . ($policy || "keine") . ")";
+    }
+
+    if ($require_rua && !@rua_domains) {
+        $status = "warn" if $status eq "ok";
+        push @notes, "Kein RUA Reporting konfiguriert, obwohl require_rua=1";
+    }
+
+    # Externe RUA Domains nur werten, wenn require_external_authorization = 1
+    if ($require_auth) {
+
+        if (@external_unapproved) {
+            $status = "warn" if $status eq "ok";
+            push @notes,
+                "RUA nutzt nicht freigegebene externe Domains: "
+                . join(", ", @external_unapproved);
+        }
+
+        my @not_authorized = grep {
+            my $d = $_;
+            my ($det) = grep { $_->{domain} eq $d } @external_details;
+            $det && !$det->{authorized_via_dns}
+        } @external_domains;
+
+        if (@not_authorized) {
+            $status = "warn" if $status eq "ok";
+            push @notes,
+                "Externe RUA Domains ohne _report._dmarc Autorisierung: "
+                . join(", ", @not_authorized);
+        }
+    }
+
+    my $detail = "DMARC ok";
+    $detail .= " (" . join(", ", @notes) . ")" if @notes;
+
+    return {
+        status           => $status,
+        detail           => $detail,
+        raw              => \@dmarc,
+        tags             => \%tags,
+        inherited_from   => $inherited_from,
+        effective_domain => $lookup_domain,
+        rua_analysis     => {
+            rua_raw                        => \@rua_raw,
+            rua_domains                    => \@rua_domains,
+            local_rua                      => \@local_rua,
+            external_domains               => \@external_domains,
+            external_allowed               => \@external_allowed,
+            external_unapproved            => \@external_unapproved,
+            require_rua                    => $require_rua + 0,
+            allowed_external_domains       => \@allow_external,
+            require_external_authorization => $require_auth + 0,
+            external_details               => \@external_details,
+        },
+    };
+}
+
+# =========================
+# DKIM (pro Profil)
+# =========================
+
+sub check_dkim {
+    my ($domain, $profile) = @_;
+
+    my $dkim_policy  = $profile->{dkim_policy} || {};
+
+    my $require_dkim = exists $profile->{require_dkim}
+        ? ($profile->{require_dkim} ? 1 : 0)
+        : $GLOBAL_REQUIRE_DKIM;
+
+    my @dkim_selectors = _as_list($dkim_policy->{selectors});
+    @dkim_selectors = _as_list($profile->{dkim_selectors}) unless @dkim_selectors;
+    @dkim_selectors = @GLOBAL_DKIM_SELECTORS               unless @dkim_selectors;
+
+    if (!@dkim_selectors) {
+        return {
+            status => "warn",
+            detail => "Keine DKIM Selector in Profil oder global definiert, Prüfung übersprungen",
+        };
+    }
+
+    my @dkim_required = _as_list($dkim_policy->{txt_required_contains});
+    @dkim_required = _as_list($profile->{dkim_txt_required_contains}) unless @dkim_required;
+    @dkim_required = @GLOBAL_DKIM_TXT_REQUIRED_CONTAINS               unless @dkim_required;
+
+    my $mode = $dkim_policy->{evaluation_mode} || 'any_ok';
+    $mode = 'any_ok' unless $mode =~ /^(any_ok|all_ok)$/;
+
+    my $groups_conf = $dkim_policy->{groups} || [];
+    my @groups      = ref $groups_conf eq 'ARRAY' ? @$groups_conf : ();
+
+    my %sel_results;
+    my @statuses;
+
+    for my $sel (@dkim_selectors) {
+        my $name = $sel . "._domainkey.$domain";
+
+        my $res = get_txt_records_with_cname($name);
+        my @txt          = @{ $res->{txt}          || [] };
+        my $cname_used   = $res->{cname_used}   ? 1 : 0;
+        my $cname_target = $res->{cname_target} || undef;
+
+        my @dkim = grep { /^v=DKIM1/i } @txt;
+
+        my $st;
+
+        if (!@dkim) {
+            $st = {
+                status       => "fail",
+                detail       => "Kein DKIM Record für Selector $sel (TXT oder CNAME Ziel)",
+                raw          => \@txt,
+                cname_used   => $cname_used,
+                cname_target => $cname_target,
+                groups       => [],
+            };
+        } else {
+            my $txt_combined = join(" ", @dkim);
+
+            my $sel_status = "ok";
+            my @group_results;
+
+            if (@groups) {
+                my $any_ok = 0;
+
+                for my $g (@groups) {
+                    my @req = _as_list($g->{required_contains});
+                    my @missing;
+
+                    for my $p (@req) {
+                        push @missing, $p unless index($txt_combined, $p) >= 0;
+                    }
+
+                    my $gst = @missing ? "fail" : "ok";
+                    $any_ok ||= ($gst eq 'ok');
+
+                    push @group_results, {
+                        name                   => $g->{name} // '',
+                        status                 => $gst,
+                        required_contains      => \@req,
+                        missing_required_parts => \@missing,
+                    };
+                }
+
+                if ($mode eq 'any_ok') {
+                    $sel_status = $any_ok ? "ok" : "fail";
+                } else {
+                    if (grep { $_->{status} eq 'fail' } @group_results) {
+                        $sel_status = "fail";
+                    } else {
+                        $sel_status = "ok";
+                    }
+                }
+            } else {
+                my @missing_parts;
+                if (@dkim_required) {
+                    for my $part (@dkim_required) {
+                        push @missing_parts, $part unless index($txt_combined, $part) >= 0;
+                    }
+                }
+
+                if (@missing_parts) {
+                    if ($require_dkim) {
+                        $sel_status = "fail";
+                    } else {
+                        $sel_status = "warn";
+                    }
+                }
+
+                @group_results = ({
+                    name                   => 'required_parts',
+                    status                 => @missing_parts ? ($require_dkim ? 'fail' : 'warn') : 'ok',
+                    required_contains      => \@dkim_required,
+                    missing_required_parts => \@missing_parts,
+                });
+            }
+
+            my @notes;
+            if ($cname_used && $cname_target) {
+                push @notes, "DKIM TXT via CNAME Ziel $cname_target";
+            }
+
+            my $detail = @notes ? join("; ", @notes) : "DKIM Record für Selector $sel gefunden";
+
+            $st = {
+                status       => $sel_status,
+                detail       => $detail,
+                raw          => \@dkim,
+                cname_used   => $cname_used,
+                cname_target => $cname_target,
+                groups       => \@group_results,
+            };
+        }
+
+        $sel_results{$sel} = $st;
+        push @statuses, $st->{status};
+    }
+
+    my $overall_status;
+
+    if ($mode eq 'all_ok') {
+        if (grep { $_ eq 'fail' } @statuses) {
+            $overall_status = 'fail';
+        } elsif (grep { $_ eq 'warn' } @statuses) {
+            $overall_status = 'warn';
+        } else {
+            $overall_status = 'ok';
+        }
+    } else {
+        if (grep { $_ eq 'ok' } @statuses) {
+            $overall_status = 'ok';
+        } elsif (grep { $_ eq 'warn' } @statuses) {
+            $overall_status = 'warn';
+        } else {
+            $overall_status = 'fail';
+        }
+    }
+
+    if ($overall_status eq "fail" and !$require_dkim) {
+        $overall_status = "warn";
+    }
+
+    my $detail = "DKIM Pruefung abgeschlossen (require_dkim=$require_dkim, mode=$mode)";
+
+    return {
+        status          => $overall_status,
+        detail          => $detail,
+        selectors       => \%sel_results,
+        require_dkim    => $require_dkim + 0,
+        required_parts  => \@dkim_required,
+        evaluation_mode => $mode,
+    };
+}
+
+# =========================
+# Hauptlogik
+# =========================
+
+my @domains;
+
+if ($opt_domain) {
+    # Nur eine Domain prüfen (CLI override)
+    @domains = (lc $opt_domain);
+    $log->info("Nur Single-Domain-Modus aktiv: $opt_domain");
+} else {
+    if ($LDAP_ENABLED) {
+        @domains = eval { fetch_domains_from_ldap() };
+        if ($@) {
+            $log->error("Fehler beim LDAP Abruf: $@");
+            print STDERR "Fehler beim LDAP Abruf: $@\n";
+            exit 1;
+        }
+    } else {
+        $log->info("LDAP ist deaktiviert, verwende nur extra_domains");
+        @domains = ();
+    }
+
+    push @domains, @EXTRA_DOMAINS if @EXTRA_DOMAINS;
+
+    my %seen;
+    @domains = grep { !$seen{$_}++ } @domains;
+
+    if (@EXCLUDE_DOMAINS) {
+        my %excl = map { $_ => 1 } @EXCLUDE_DOMAINS;
+        my @before = @domains;
+        @domains = grep { !$excl{$_} } @domains;
+
+        my @removed = grep { $excl{$_} } @before;
+        if (@removed) {
+            $log->info("Ausgeschlossene Domains: " . join(", ", @removed));
+        }
+    }
+}
+
+if (!@domains) {
+    $log->warn("Keine Domains zu prüfen nach Exclude Filter / CLI Auswahl");
+}
+
+my @results;
+my $global_status = "ok";
+
+for my $dom (@domains) {
+    $log->info("Prüfe Domain: $dom");
+
+    my $dom_result;
+    eval {
+        my %profile_results;
+        my $best_profile;
+        my $best_status = 'fail';  # Ranking: ok > warn > fail
+
+        for my $pname (sort keys %{$PROFILE_CONF}) {
+            my $p = $PROFILE_CONF->{$pname} || {};
+
+            my $mx    = check_mx($dom,    $p->{mx_policy} || {});
+            my $spf   = check_spf($dom,   $p);
+            my $dmarc = check_dmarc($dom, $p);
+            my $dkim  = check_dkim($dom,  $p);
+
+            my @st = map { $_->{status} } ($mx, $spf, $dmarc, $dkim);
+
+            my $profile_status = "ok";
+            if (grep { $_ eq "fail" } @st) {
+                $profile_status = "fail";
+            } elsif (grep { $_ eq "warn" } @st) {
+                $profile_status = "warn";
+            }
+
+            $profile_results{$pname} = {
+                status => $profile_status,
+                checks => {
+                    mx    => $mx,
+                    spf   => $spf,
+                    dmarc => $dmarc,
+                    dkim  => $dkim,
+                },
+            };
+
+            if ($profile_status eq 'ok') {
+                if ($best_status ne 'ok') {
+                    $best_status  = 'ok';
+                    $best_profile = $pname;
+                }
+            } elsif ($profile_status eq 'warn') {
+                if ($best_status eq 'fail') {
+                    $best_status  = 'warn';
+                    $best_profile = $pname;
+                }
+            } elsif (!$best_profile) {
+                $best_status  = 'fail';
+                $best_profile = $pname;
+            }
+        }
+
+        my $dom_status = $best_status || 'fail';
+
+        if ($dom_status eq "fail") {
+            $global_status = "fail";
+        } elsif ($dom_status eq "warn" and $global_status eq "ok") {
+            $global_status = "warn";
+        }
+
+        $dom_result = {
+            domain              => $dom,
+            status              => $dom_status,
+            best_profile        => $best_profile,
+            best_profile_status => $best_status,
+            profiles            => \%profile_results,
+        };
+
+        1;
+    } or do {
+        my $err = $@ || 'Unbekannter Fehler';
+        $log->error("Fehler bei Domain $dom: $err");
+
+        $global_status = "fail";
+
+        $dom_result = {
+            domain => $dom,
+            status => 'fail',
+            error  => "$err",
+        };
+    };
+
+    push @results, $dom_result if $dom_result;
+}
+
+my $summary = {
+    timestamp     => strftime("%Y-%m-%dT%H:%M:%S", localtime),
+    config_file   => $config_file,
+    global_status => $global_status,
+    domains_total => scalar(@domains),
+    results       => \@results,
+};
+
+eval {
+    my $json = encode_json($summary);
+    my ($vol, $dir, undef) = File::Spec->splitpath($JSON_FILE);
+    my $path_dir = File::Spec->catpath($vol, $dir, "");
+    if ($path_dir && !-d $path_dir) {
+        mkdir $path_dir or die "Kann Verzeichnis nicht erstellen: $path_dir: $!";
+    }
+    open my $fh, ">:utf8", $JSON_FILE or die "Kann JSON File nicht schreiben: $JSON_FILE: $!";
+    print $fh $json;
+    close $fh;
+    $log->info("JSON Report nach $JSON_FILE geschrieben");
+};
+if ($@) {
+    $log->error("Fehler beim Schreiben des JSON Reports: $@");
+}
+
+$log->info("Fertig, globaler Status: $global_status");
+
+print "domain_dns_audit status: $global_status, Domains: " . scalar(@domains) . "\n";
+
+if ($global_status eq "ok") {
+    exit 0;
+} elsif ($global_status eq "warn") {
+    exit 1;
+} else {
+    exit 2;
+}
