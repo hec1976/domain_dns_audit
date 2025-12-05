@@ -303,10 +303,5 @@ Damit läuft der Audit mit globalen Defaults und einem einfachen Profil.
 
 ---
 
-# Datei-Download
 
-Die neue, vollständige README findest du hier:
-
-👉 **Download: `README_domain_dns_audit.md`**  
-[sandbox:/mnt/data/domain_dns_config_README.md](sandbox:/mnt/data/domain_dns_config_README.md)
 
