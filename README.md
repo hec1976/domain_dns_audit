@@ -1,151 +1,71 @@
-# domain_dns_audit – DNS-Audit für Mail-Domains (MX, SPF, DMARC, DKIM)
+# domain_dns_audit
 
-domain_dns_audit ist ein leistungsfähiges Perl-Tool zur automatisierten Überprüfung von Mail-Domain-Konfigurationen.
-Es analysiert MX, SPF, DMARC (inkl. RUA-Checks nach RFC 7489) sowie DKIM, gruppiert die Ergebnisse nach frei definierbaren Profilen und erzeugt einen strukturierten JSON-Report für Monitoring, Security-Audits oder Migrationsprojekte.
+> **English summary**  
+> `domain_dns_audit` is a Perl-based DNS audit tool for mail domains.  
+> It checks **MX, SPF, DMARC (incl. RUA & external authorization)** and **DKIM**,  
+> validates results against **profile-based policies**, and generates a structured  
+> **JSON report** for monitoring, security audits, compliance checks and migrations.
 
-## Typische Anwendungsfälle
-- Überprüfung von Mail-Security-Konfigurationen  
-- Vorbereitung oder Kontrolle von DMARC-Reports  
-- Identifikation fehlerhafter oder unsicherer DNS-Setups  
-- Automatisiertes Monitoring im Betrieb  
+---
 
-# Funktionen
+## 🇩🇪 Übersicht
 
-## ✓ MX-Analyse
-- Unterstützung von Profilen (mehrere MX-Gruppen)
-- Prüfung erwarteter Hosts
-- Option, ob zusätzliche MX erlaubt sind
+`domain_dns_audit` ist ein leistungsfähiges DNS-Audit-Tool zur automatisierten Prüfung von Mail-Domain-Konfigurationen.  
+Es analysiert **MX, SPF, DMARC und DKIM**, wendet **regelbasierte Profile** an und erzeugt einen strukturierten **JSON-Report** für Monitoring-Systeme, Security-Audits oder Mail-Migrationsprojekte.
 
-## ✓ SPF-Analyse
-- Erkennung von redirect=
-- Bewertung aller Modi: -all, ~all, ?all, offen
-- Prüfung auf Pflichtbestandteile
-- Profilbasierte Regeln (z. B. open verboten)
+### ✨ Hauptfunktionen
 
-## ✓ DMARC-Analyse (RFC-konform)
-- Ermittlung der DMARC-Policy
-- Korrekte DMARC-Vererbung über Organizational Domain (Public Suffix List)
-- Analyse der RUA-Adressen (lokal, extern)
-- Optional: Prüfung externer Autorisierung via `<domain>._report._dmarc.<provider> TXT "v=DMARC1"`
+- **MX-Analyse** mit Profilen & Gruppen (mehrere MX-Layouts möglich)  
+- **SPF-Analyse** inkl. Modusbewertung (hard, soft, neutral, open, none)  
+- **DMARC-Analyse**  
+  - Fallback auf Organizational Domain (Public Suffix Logik)  
+  - Prüfung von `rua=` (lokal vs. extern)  
+  - Validierung externer RUA-Provider über `_report._dmarc.<domain>`  
+- **DKIM-Analyse**  
+  - mehrere Selector  
+  - CNAME-Auflösung  
+  - Pflichtteile im DKIM-TXT  
+  - Profilbasiertes Bewertungsmodell  
+- **LDAP-Integration** für Domain-Ermittlung (optional)  
+- **JSON-Report** mit detaillierter Struktur & Gesamtstatus  
+- **Logging & Exitcodes** für automatisches Monitoring
 
-## ✓ DKIM-Analyse
-- Unterstützung mehrerer Selector pro Profil
-- TXT Records direkt oder via CNAME
-- Prüfung auf Pflichtteile oder Gruppenkriterien
+---
 
-## ✓ JSON-Report
-- Übersicht zu allen geprüften Domains
-- Detailauswertung pro Profil und Check
-- Status: ok, warn, fail
-- Ideal für Monitoring-Systeme
+## 📦 Dokumentation
 
-## ✓ LDAP-Integration (optional)
-- Automatischer Abruf von Domains via `associatedDomain`
-- Alternativ: statische Domains aus Config
+- **Konfigurationshandbuch**  
+  👉 [`domain_dns_config_README.md`](./domain_dns_config_README.md)
 
-## ✓ CLI-Funktionen
-- `--domain example.ch` für Einzelchecks
-- `--debug` für erweitertes Logging
-- `--config FILE` zum Überschreiben der Konfiguration
+- **Beispielkonfiguration**  
+  👉 [`domain_dns_audit.json.example`](./domain_dns_audit.json.example)
 
-# Installation
+---
 
-## Perl-Module (Beispiele)
-Unter openSUSE / SLES z. B. via Zypper oder CPAN installierbar:
+## 🚀 Kurzes Beispiel
 
-- Net::LDAP  
-- Net::DNS  
-- JSON::MaybeXS  
-- Log::Log4perl  
-- Domain::PublicSuffix  
-- Getopt::Long  
-
-## Script ausführbar machen
 ```bash
-chmod +x domain_dns_audit.pl
+perl domain_dns_audit.pl --config ./domain_dns_audit.json
 ```
 
-# Konfiguration
+JSON-Output liegt danach unter:
 
-Standard-Datei:
-```
-./domain_dns_audit.json
-```
-
-Diese definiert:
-- DNS-Server  
-- Output-Pfade  
-- Domains (statisch, LDAP, Ausschlusslisten)  
-- Globale Sicherheitsvorgaben  
-- Profile: MX/SPF/DMARC/DKIM-Regeln  
-
-Ein vollständiges Beispiel liegt als
-`domain_dns_audit.json.example`
-im Repo.
-
-# Beispiele
-
-## Alle Domains prüfen
-```bash
-./domain_dns_audit.pl
-```
-
-## Nur eine Domain prüfen
-```bash
-./domain_dns_audit.pl --domain example.ch --debug
-```
-
-## Eigene Config nutzen
-```bash
-./domain_dns_audit.pl --config /etc/mmbb/domain_dns_audit.json
-```
-
-# Output
-
-## Logfile
-Ort wird in der Config definiert, z. B.:
-```
-/var/log/mmbb/domain_dns_audit.log
-```
-
-## JSON-Report
-Vollständige Auswertung:
 ```
 /var/log/mmbb/domain_dns_audit.json
 ```
 
-Enthält u. a.:
-- globalen Status  
-- Status pro Domain  
-- bestes Profil  
-- Detailchecks MX/SPF/DMARC/DKIM  
+---
 
-# DMARC-Vererbung (RFC 7489)
+## 🔧 Typische Anwendungsfälle
 
-Beispiele:
+- E-Mail Security Audits (MX/SPF/DMARC/DKIM)
+- Vorbereitung oder Kontrolle von DMARC-Rollouts
+- Monitoring & Alerting (Nagios/Checkmk/Prometheus via JSON)
+- Mail-Migrationen & Domain-Inventare
+- Security-Compliance (z. B. Richtlinien für SPF/DMARC/DKIM)
 
-| Domain              | Org-Domain   |
-|--------------------|--------------|
-| mail.example.ch    | example.ch   |
-| service.test.co.uk | test.co.uk   |
-| shop.example.com   | example.com  |
+---
 
-Falls `_dmarc.sub.example.ch` fehlt → automatisch `_dmarc.example.ch`.
+## 📄 Lizenz
 
-# Exitcodes
-
-| Code | Bedeutung           |
-|------|----------------------|
-| 0    | Alles OK             |
-| 1    | Warnungen vorhanden  |
-| 2    | Fehler gefunden       |
-
-Cronjob Beispiel:
-```
-0 3 * * * /opt/mmbb_script/domain-dns-audit/domain_dns_audit.pl >/dev/null 2>&1
-```
-
-# Lizenz
-
-Empfehlung: MIT Lizenz  
-Frei verwendbar in Unternehmen, Open Source Projekten und im privaten Umfeld.
+MIT License (siehe LICENSE)
