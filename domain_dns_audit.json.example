@@ -1,26 +1,152 @@
 {
-    "ldap": {
-        "enabled": false
-    },
-    "domains": {
-        "extra_domains": [
-            "example.ch"
-        ]
-    },
-    "output": {
-        "log_file": "/var/log/mmbb/domain_dns_audit.log",
-        "json_file": "/var/log/mmbb/domain_dns_audit.json"
-    },
-    "check": {
-        "require_spf": 1,
-        "require_dkim": 1,
-        "profiles": {
-            "default": {
-                "mx_policy": {},
-                "spf_policy": {},
-                "dmarc_policy": {},
-                "dkim_policy": {}
+  "ldap": {
+    "enabled": false,
+    "uri": "",
+    "bind_dn": "",
+    "bind_pw": "",
+    "base_dn": "",
+    "filter": "(objectClass=*)",
+    "attr_domain": "associatedDomain"
+  },
+  "dns": {
+    "servers": [
+      "8.8.8.8",
+      "9.9.9.9"
+    ]
+  },
+  "domains": {
+    "extra_domains": [
+      "example.ch",
+      "shop.example.ch",
+      "example.net"
+    ],
+    "exclude_domains": [
+      "legacy.example.ch"
+    ]
+  },
+  "output": {
+    "log_file": "/var/log/mmbb/domain_dns_audit.log",
+    "json_file": "/var/log/mmbb/domain_dns_audit.json",
+    "log_level": "INFO"
+  },
+  "check": {
+    "require_spf": 1,
+    "require_dkim": 1,
+    "dmarc_ok_policies": [
+      "reject",
+      "quarantine"
+    ],
+    "dkim_selectors": [
+      "selector1",
+      "selector2"
+    ],
+    "dkim_txt_required_contains": [
+      "v=DKIM1",
+      "k=rsa",
+      "p="
+    ],
+    "profiles": {
+      "internet-strict": {
+        "mx_policy": {
+          "groups": [
+            {
+              "name": "Primary MX Cluster",
+              "mx_required": [
+                "mx1.mail.example.ch",
+                "mx2.mail.example.ch"
+              ],
+              "mx_allow_others": 0
             }
+          ]
+        },
+        "spf_policy": {
+          "defaults": {
+            "allowed_modes": [
+              "hard",
+              "soft"
+            ],
+            "forbid_open": 1
+          },
+          "groups": [
+            {
+              "name": "Standard SPF",
+              "allowed_modes": [
+                "hard",
+                "soft"
+              ],
+              "required_contains": [
+                "include:_spf.example.ch"
+              ],
+              "forbid_open": 1
+            }
+          ]
+        },
+        "dmarc_policy": {
+          "ok_policies": [
+            "reject",
+            "quarantine"
+          ],
+          "require_rua": 1,
+          "allow_external_rua_domains": [
+            "reports.dmarc-provider.tld"
+          ],
+          "require_external_authorization": 1
+        },
+        "dkim_policy": {
+          "selectors": [
+            "selector1",
+            "selector2"
+          ],
+          "txt_required_contains": [
+            "v=DKIM1",
+            "k=rsa",
+            "p="
+          ],
+          "evaluation_mode": "any_ok"
         }
+      },
+      "internet-relaxed": {
+        "mx_policy": {
+          "groups": [
+            {
+              "name": "Any MX allowed",
+              "mx_required": [],
+              "mx_allow_others": 1
+            }
+          ]
+        },
+        "spf_policy": {
+          "defaults": {
+            "allowed_modes": [
+              "hard",
+              "soft",
+              "neutral"
+            ],
+            "forbid_open": 1
+          },
+          "groups": []
+        },
+        "dmarc_policy": {
+          "ok_policies": [
+            "reject",
+            "quarantine",
+            "none"
+          ],
+          "require_rua": 0,
+          "allow_external_rua_domains": [],
+          "require_external_authorization": 0
+        },
+        "dkim_policy": {
+          "selectors": [
+            "selector1"
+          ],
+          "txt_required_contains": [
+            "v=DKIM1",
+            "p="
+          ],
+          "evaluation_mode": "any_ok"
+        }
+      }
     }
+  }
 }
