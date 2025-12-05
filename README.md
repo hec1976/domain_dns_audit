@@ -426,7 +426,7 @@ Wenn zum Beispiel `_dmarc.sub.example.ch` fehlt, wird automatisch `_dmarc.exampl
 Beispiel Cronjob:
 
 ```cron
-0 3 * * * /opt/mmbb_script/domain-dns-audit/domain_dns_audit.pl >/dev/null 2>&1
+0 3 * * * /opt/domain-dns-audit/domain_dns_audit.pl >/dev/null 2>&1
 ```
 
 ---
