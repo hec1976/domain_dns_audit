@@ -83,6 +83,169 @@ Ein vollständiges Beispiel liegt als
 `domain_dns_audit.json.example`
 im Repo.
 
+
+Die Konfiguration steuert sämtliche Funktionen des Tools: welche Domains geprüft werden, welche DNS-Server genutzt werden und welche Sicherheitsrichtlinien gelten.
+
+## 1. LDAP-Konfiguration (optional)
+
+```json
+{
+  "enabled": false,
+  "uri": "",
+  "bind_dn": "",
+  "bind_pw": "",
+  "base_dn": "",
+  "filter": "(objectClass=*)",
+  "attr_domain": "associatedDomain"
+}
+```
+
+## 2. DNS-Resolver
+
+```json
+{
+  "servers": ["8.8.8.8", "9.9.9.9"]
+}
+```
+
+## 3. Domainlisten
+
+```json
+{
+  "extra_domains": ["example.ch", "shop.example.ch"],
+  "exclude_domains": ["legacy.example.ch"]
+}
+```
+
+## 4. Output
+
+```json
+{
+  "log_file": "/var/log/mmbb/domain_dns_audit.log",
+  "json_file": "/var/log/mmbb/domain_dns_audit.json",
+  "log_level": "INFO"
+}
+```
+
+## 5. Globale Prüfparameter
+
+```json
+{
+  "require_spf": 1,
+  "require_dkim": 1,
+  "dmarc_ok_policies": ["reject", "quarantine"],
+  "dkim_selectors": ["selector1", "selector2"],
+  "dkim_txt_required_contains": ["v=DKIM1", "k=rsa", "p="]
+}
+```
+
+## 6. Profile
+
+### 6.1 internet-strict (Produktion)
+
+```json
+{
+  "mx_policy": {
+    "groups": [
+      {
+        "name": "Primary MX Cluster",
+        "mx_required": ["mx1.mail.example.ch", "mx2.mail.example.ch"],
+        "mx_allow_others": 0
+      }
+    ]
+  },
+  "spf_policy": {
+    "defaults": {
+      "allowed_modes": ["hard", "soft"],
+      "forbid_open": 1
+    },
+    "groups": [
+      {
+        "name": "Standard SPF",
+        "allowed_modes": ["hard", "soft"],
+        "required_contains": ["include:_spf.example.ch"],
+        "forbid_open": 1
+      }
+    ]
+  },
+  "dmarc_policy": {
+    "ok_policies": ["reject", "quarantine"],
+    "require_rua": 1,
+    "allow_external_rua_domains": ["reports.dmarc-provider.tld"],
+    "require_external_authorization": 1
+  },
+  "dkim_policy": {
+    "selectors": ["selector1", "selector2"],
+    "txt_required_contains": ["v=DKIM1", "k=rsa", "p="],
+    "evaluation_mode": "any_ok"
+  }
+}
+```
+
+### 6.2 internet-relaxed (Testsysteme)
+
+```json
+{
+  "mx_policy": {
+    "groups": [
+      {
+        "name": "Any MX allowed",
+        "mx_required": [],
+        "mx_allow_others": 1
+      }
+    ]
+  },
+  "spf_policy": {
+    "defaults": {
+      "allowed_modes": ["hard", "soft", "neutral"]
+    }
+  },
+  "dmarc_policy": {
+    "ok_policies": ["reject", "quarantine", "none"],
+    "require_rua": 0
+  },
+  "dkim_policy": {
+    "selectors": ["selector1"],
+    "txt_required_contains": ["v=DKIM1", "p="],
+    "evaluation_mode": "any_ok"
+  }
+}
+```
+
+## 7. Vollständiges Minimalbeispiel
+
+```json
+{
+  "ldap": {
+    "enabled": false
+  },
+  "dns": {
+    "servers": ["8.8.8.8"]
+  },
+  "domains": {
+    "extra_domains": ["example.ch"],
+    "exclude_domains": []
+  },
+  "output": {
+    "log_file": "/var/log/mmbb/domain_dns_audit.log",
+    "json_file": "/var/log/mmbb/domain_dns_audit.json"
+  },
+  "check": {
+    "require_spf": 1,
+    "require_dkim": 1,
+    "profiles": {
+      "default": {
+        "mx_policy": {},
+        "spf_policy": {},
+        "dmarc_policy": {},
+        "dkim_policy": {}
+      }
+    }
+  }
+}
+```
+
+
 # Beispiele
 
 ## Alle Domains prüfen
