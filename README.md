@@ -83,6 +83,7 @@ Ein vollständiges Beispiel liegt als
 `domain_dns_audit.json.example`
 im Repo.
 
+# Konfiguration (domain_dns_audit.json)
 
 Die Konfiguration steuert sämtliche Funktionen des Tools: welche Domains geprüft werden, welche DNS-Server genutzt werden und welche Sicherheitsrichtlinien gelten.
 
