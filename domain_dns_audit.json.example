@@ -1,0 +1,26 @@
+{
+    "ldap": {
+        "enabled": false
+    },
+    "domains": {
+        "extra_domains": [
+            "example.ch"
+        ]
+    },
+    "output": {
+        "log_file": "/var/log/mmbb/domain_dns_audit.log",
+        "json_file": "/var/log/mmbb/domain_dns_audit.json"
+    },
+    "check": {
+        "require_spf": 1,
+        "require_dkim": 1,
+        "profiles": {
+            "default": {
+                "mx_policy": {},
+                "spf_policy": {},
+                "dmarc_policy": {},
+                "dkim_policy": {}
+            }
+        }
+    }
+}
