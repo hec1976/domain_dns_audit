@@ -505,3 +505,25 @@ Mögliche Erweiterungen:
 - Optionaler Support für DNSSEC Status Auswertung
 
 Pull Requests, Issues und Verbesserungsvorschläge sind willkommen.
+
+
+
+## Vergleich zu anderen Lösungen
+
+domain_dns_audit ist kein weiterer einzelner SPF oder DMARC Online Checker, sondern ein Audit Werkzeug für ganze Domainbestände mit Policy Engine, RFC Checks und JSON Output.
+
+| Funktion | Typische Online Checker | DMARC SaaS (Basisfunktionen) | domain_dns_audit |
+|---------|--------------------------|------------------------------|------------------|
+| MX Prüfung mit Profilen | Einzelne Domainchecks, meist ohne definierbare Profile | Teilweise Überblick pro Domain, selten hart profilbasiert | MX Profile mit Gruppen, mx_required, mx_allow_others und Best Profile Auswahl pro Domain |
+| SPF Auswertung | Zeigt Record und oft nur einfachen Hinweis auf all Modus | Teilweise Hinweise zu SPF Qualität, Fokus auf Reporting | SPF Deep Analysis gemäss RFC 7208 mit Lookup Zähler, Rekursion, Loop Detection und Profilbewertung |
+| SPF Lookup Limit (10) | Meist nur Warnung im Web UI | Teilweise als Hinweis im Portal | Technisch ausgewertetes Limit im Audit mit Status und rfc_analysis im JSON Output |
+| DMARC Policy Check | Anzeige von p, rua, ruf und ein paar Empfehlungen | Integriert in das Reporting Dashboard | DMARC Policy Check mit ok_policies, Subdomain Inheritance und strikter Bewertung |
+| Externe RUA Empfänger | Oft nur als Hinweis in der Dokumentation | Teilweise sichtbar im Portal | Analyse von externen RUA Domains inkl. _report._dmarc Autorisierung, Allowlist und Detailauswertung pro Provider |
+| DKIM Prüfung | Einzelcheck für einen Selector | Teilweise Erkennung, Fokus auf Traffic Auswertung | Mehrere Selector Gruppen, CNAME Auflösung, required_contains, evaluation_mode und expected_txt Abgleich auf Tag Ebene |
+| Domains aus LDAP | Nicht vorhanden | Meist nur manuelle Eingabe oder Import | LDAP Integration mit associatedDomain, Filtern, mehreren URIs und automatischer Domainliste |
+| Parallelisierung | Nicht relevant, Web UI arbeitet pro Anfrage | Batch Checks meist intern, nicht steuerbar | Parallel Forking mit max_procs für schnelle Audits grosser Domainbestände |
+| Ausgabeformate | HTML im Browser | Web GUI, proprietäre Reports | Strukturierter JSON Report mit global_status, Profilen und Detail Checks, ideal für Monitoring, Dashboards und Automatisierung |
+| Betriebsintegration | Manuell, Copy Paste aus der Weboberfläche | Über Schnittstellen des jeweiligen Produkts | CLI Tool, skriptbar, mit Logging, Dry Run und klaren Exitcodes für CI, Cron und Monitoring |
+
+Kurz gesagt: domain_dns_audit kombiniert die typischen Einzelchecks von Online Werkzeugen mit einer Policy Engine, LDAP Anbindung und RFC naher Analyse von SPF, DMARC und DKIM für den produktiven Betrieb.
+
