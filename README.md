@@ -23,11 +23,11 @@
 [![Tests](https://img.shields.io/badge/tests-passing-brightgreen)]()
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-blue)]()
 
-**Projekt:** domain_dns_audit  
-**Beschreibung:** Enterprise DNS Security Audit & Compliance Tool (LDAP → DNS → JSON)  
-**Sprache:** Perl 5.30+  
-**Zweck:** Automatisierte DNS-Sicherheitsaudits für E-Mail Authentifizierung (MX, SPF, DKIM, DMARC)
-
+> **Projekt:** domain_dns_audit  
+> **Beschreibung:** Enterprise DNS Security Audit & Compliance Tool (LDAP → DNS → JSON)  
+> **Sprache:** Perl 5.30+  
+> **Zweck:** Automatisierte DNS-Sicherheitsaudits für E-Mail Authentifizierung (MX, SPF, DKIM, DMARC)
+---
 
 `domain_dns_audit` ist ein Perl Tool zur automatisierten Prüfung der DNS Konfiguration von Mail Domains.  
 Es wertet MX, SPF, DMARC und DKIM aus, unterstützt Profile pro Sicherheitsniveau und erzeugt einen strukturierten JSON Report, der sich ideal für Monitoring, Security Audits und Migrationsprojekte eignet.
