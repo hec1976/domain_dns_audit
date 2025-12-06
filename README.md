@@ -1,5 +1,28 @@
 # domain_dns_audit – DNS Audit für Mail Domains (MX, SPF, DMARC, DKIM)
 
+```
+██████╗  ██████╗ ███╗   ███╗ █████╗ ██╗███╗   ██╗    ██████╗ ███╗   ██╗███████╗    █████╗ ██╗   ██╗██████╗ ██╗████████╗
+██╔══██╗██╔═══██╗████╗ ████║██╔══██╗██║████╗  ██║    ██╔══██╗████╗  ██║██╔════╝   ██╔══██╗██║   ██║██╔══██╗██║╚══██╔══╝
+██║  ██║██║   ██║██╔████╔██║███████║██║██╔██╗ ██║    ██║  ██║██╔██╗ ██║███████╗   ███████║██║   ██║██║  ██║██║   ██║
+██║  ██║██║   ██║██║╚██╔╝██║██╔══██║██║██║╚██╗██║    ██║  ██║██║╚██╗██║╚════██║   ██╔══██║██║   ██║██║  ██║██║   ██║
+██████╔╝╚██████╔╝██║ ╚═╝ ██║██║  ██║██║██║ ╚████║    ██████╔╝██║ ╚████║███████║██╗██║  ██║╚██████╔╝██████╔╝██║   ██║
+╚═════╝  ╚═════╝ ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝    ╚═════╝ ╚═╝  ╚═══╝╚══════╝╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝   ╚═╝
+```
+
+![Status](https://img.shields.io/badge/status-stable-brightgreen)
+![Version](https://img.shields.io/badge/version-1.2.0-blue)
+![License](https://img.shields.io/badge/license-MIT-purple)
+![Python](https://img.shields.io/badge/python-3.6%2B-yellow)
+![Security](https://img.shields.io/badge/CodeQL-Security%20Scan-blueviolet)
+
+> **Projekt:** dmarc-ingest  
+> **Beschreibung:** DMARC RUA Ingest- und Normalisierungs-Engine (IMAP → Syslog/JSON/NDJSON)  
+> **Repository:** https://github.com/hec1976/dmarc-ingest  
+
+```
+
+
+
 `domain_dns_audit` ist ein Perl Tool zur automatisierten Prüfung der DNS Konfiguration von Mail Domains.  
 Es wertet MX, SPF, DMARC und DKIM aus, unterstützt Profile pro Sicherheitsniveau und erzeugt einen strukturierten JSON Report, der sich ideal für Monitoring, Security Audits und Migrationsprojekte eignet.
 
