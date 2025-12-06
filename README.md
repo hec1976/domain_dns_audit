@@ -1,33 +1,32 @@
-# domain_dns_audit – DNS Audit für Mail Domains (MX, SPF, DMARC, DKIM)
+# domain_dns_audit
 
 ```
-
   ██████╗  ██████╗ ███╗   ███╗ █████╗ ██╗███╗   ██╗   ██████╗ ███╗   ██╗███████╗   
   ██╔══██╗██╔═══██╗████╗ ████║██╔══██╗██║████╗  ██║   ██╔══██╗████╗  ██║██╔════╝ 
   ██║  ██║██║   ██║██╔████╔██║███████║██║██╔██╗ ██║   ██║  ██║██╔██╗ ██║███████╗          
   ██║  ██║██║   ██║██║╚██╔╝██║██╔══██║██║██║╚██╗██║   ██║  ██║██║╚██╗██║╚════██║    
   ██████╔╝╚██████╔╝██║ ╚═╝ ██║██║  ██║██║██║ ╚████║   ██████╔╝██║ ╚████║███████║     
   ╚═════╝  ╚═════╝ ╚═╝     ╚═╝╚═╝  ╚═╝╚═╝╚═╝  ╚═══╝   ╚═════╝ ╚═╝  ╚═══╝╚══════╝     
-                  █████╗ ██╗   ██╗██████╗ ██╗████████╗ 
-                 ██╔══██╗██║   ██║██╔══██╗██║╚══██╔══╝   
-                 ███████║██║   ██║██║  ██║██║   ██║
-                 ██╔══██║██║   ██║██║  ██║██║   ██║
-                 ██║  ██║╚██████╔╝██████╔╝██║   ██║
-                 ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝   ╚═╝       
+                      █████╗ ██╗   ██╗██████╗ ██╗████████╗ 
+                     ██╔══██╗██║   ██║██╔══██╗██║╚══██╔══╝   
+                     ███████║██║   ██║██║  ██║██║   ██║
+                     ██╔══██║██║   ██║██║  ██║██║   ██║
+                     ██║  ██║╚██████╔╝██████╔╝██║   ██║
+                     ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝   ╚═╝       
 ```
 
-![Status](https://img.shields.io/badge/status-stable-brightgreen)
-![Version](https://img.shields.io/badge/version-1.2.0-blue)
-![License](https://img.shields.io/badge/license-MIT-purple)
-![Python](https://img.shields.io/badge/python-3.6%2B-yellow)
-![Security](https://img.shields.io/badge/CodeQL-Security%20Scan-blueviolet)
+[![Status](https://img.shields.io/badge/status-production-brightgreen)]()
+[![Version](https://img.shields.io/badge/version-1.0.0-blue)]()
+[![License](https://img.shields.io/badge/license-MIT-purple)]()
+[![Perl](https://img.shields.io/badge/perl-5.30%2B-yellow)]()
+[![Security](https://img.shields.io/badge/DNS-Security_Audit-orange)]()
+[![Tests](https://img.shields.io/badge/tests-passing-brightgreen)]()
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-blue)]()
 
-> **Projekt:** dmarc-ingest  
-> **Beschreibung:** DMARC RUA Ingest- und Normalisierungs-Engine (IMAP → Syslog/JSON/NDJSON)  
-> **Repository:** https://github.com/hec1976/dmarc-ingest  
-
-
-
+**Projekt:** domain_dns_audit  
+**Beschreibung:** Enterprise DNS Security Audit & Compliance Tool (LDAP → DNS → JSON)  
+**Sprache:** Perl 5.30+  
+**Zweck:** Automatisierte DNS-Sicherheitsaudits für E-Mail Authentifizierung (MX, SPF, DKIM, DMARC)
 
 
 `domain_dns_audit` ist ein Perl Tool zur automatisierten Prüfung der DNS Konfiguration von Mail Domains.  
