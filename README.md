@@ -19,9 +19,8 @@
 [![Version](https://img.shields.io/badge/version-1.0.0-blue)]()
 [![License](https://img.shields.io/badge/license-MIT-purple)]()
 [![Perl](https://img.shields.io/badge/perl-5.30%2B-yellow)]()
-[![Security](https://img.shields.io/badge/DNS-Security_Audit-orange)]()
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen)]()
-[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-blue)]()
+![Security](https://img.shields.io/badge/CodeQL-Security%20Scan-blueviolet)
+
 
 > **Projekt:** domain_dns_audit  
 > **Beschreibung:** Enterprise DNS Security Audit & Compliance Tool (LDAP → DNS → JSON)  
