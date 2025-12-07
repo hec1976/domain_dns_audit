@@ -8,7 +8,7 @@ use open qw(:std :utf8);
 use Net::LDAP;
 use Net::LDAP::Util qw(ldap_error_text);
 use Net::DNS;
-use JSON::MaybeXS qw(encode_json decode_json);
+use JSON::MaybeXS qw(encode_json decode_json JSON);
 use Log::Log4perl;
 use POSIX qw(strftime);
 use FindBin;
@@ -17,12 +17,15 @@ use Getopt::Long;
 use Domain::PublicSuffix;
 use Parallel::ForkManager;
 use Time::Out qw(timeout);
+use NetAddr::IP;
+
+
 
 # =========================
 # Version / Konstanten
 # =========================
 
-my $VERSION             = '1.0.0';
+my $VERSION             = '1.1.0';
 my $SCRIPT_DIR          = $FindBin::Bin;
 my $DEFAULT_CONFIG      = File::Spec->catfile($SCRIPT_DIR, 'domain_dns_audit.json');
 my $DEFAULT_LDAP_CONFIG = File::Spec->catfile($SCRIPT_DIR, 'domain_dns_ldap.json');
@@ -60,9 +63,11 @@ Optionen:
   --config FILE       Pfad zur JSON Konfiguration (Default: $DEFAULT_CONFIG)
                       (DNS, Domains, Checks, Output usw.)
   --ldap-config FILE  Separates JSON nur für LDAP (optional).
-                      Default (falls vorhanden): $DEFAULT_LDAP_CONFIG
-                      Entweder:
-                        { "ldap": { ... } }  oder direkt { uri: ..., base_dn: ... }
+                      Default Reihenfolge:
+                        1) --ldap-config
+                        2) ldap.ldapconfigpath in Haupt Config
+                        3) $DEFAULT_LDAP_CONFIG (falls vorhanden)
+                        4) ldap Block aus Haupt Config
 
   --domain DOMAIN     Nur diese eine Domain prüfen (LDAP/extra_domains werden ignoriert)
   --debug             Log Level DEBUG aktivieren
@@ -91,7 +96,8 @@ if ($opt_version) {
 # Konfiguration laden
 # =========================
 
-my $config_file = $opt_config // $DEFAULT_CONFIG;
+my $config_file = $opt_config || $DEFAULT_CONFIG;
+  die "Config file does not exist: $config_file" unless -f $config_file;
 
 open my $cfh, '<:utf8', $config_file
   or die "Kann Config nicht oeffnen: $config_file: $!";
@@ -100,8 +106,16 @@ local $/;
 my $config_json = <$cfh>;
 close $cfh;
 
-my $conf = eval { decode_json($config_json) };
-die "Fehler beim Parsen der JSON Config $config_file: $@" if $@;
+
+# Expliziten Parser mit Fehlerbehandlung erstellen
+my $json_parser = JSON->new->utf8->relaxed->allow_nonref;
+my $conf = eval {
+    $json_parser->decode($config_json);
+};
+if ($@) {
+    chomp $@;
+    die "Fehler beim Parsen der JSON Config $config_file: $@\n";
+}
 die "Config $config_file ist kein JSON Objekt\n" unless ref $conf eq 'HASH';
 
 # Haupt Config Bereiche
@@ -145,10 +159,18 @@ $log->info("CLI: debug=$opt_debug, domain=" . ($opt_domain // '') . ", dry_run=$
 
 my $ldap_config_file;
 
+# 1. CLI
 if (defined $opt_ldap_config) {
     $ldap_config_file = $opt_ldap_config;
     $log->info("LDAP Config per CLI gesetzt: $ldap_config_file");
-} elsif (-e $DEFAULT_LDAP_CONFIG) {
+}
+# 2. Pfad aus Hauptconfig
+elsif (defined $ldap_conf->{ldapconfigpath} && $ldap_conf->{ldapconfigpath} ne '') {
+    $ldap_config_file = $ldap_conf->{ldapconfigpath};
+    $log->info("LDAP Config aus Haupt Config (ldap.ldapconfigpath): $ldap_config_file");
+}
+# 3. Default im Scriptverzeichnis
+elsif (-e $DEFAULT_LDAP_CONFIG) {
     $ldap_config_file = $DEFAULT_LDAP_CONFIG;
     $log->info("Verwende Default LDAP Config: $ldap_config_file");
 }
@@ -167,13 +189,13 @@ if ($ldap_config_file) {
 
     if (exists $ldap_raw->{ldap} && ref $ldap_raw->{ldap} eq 'HASH') {
         $ldap_conf = $ldap_raw->{ldap};
-        $log->info("LDAP Config aus ldap Block uebernommen");
+        $log->info("LDAP Config aus ldap Block der externen Datei uebernommen");
     } else {
         $ldap_conf = $ldap_raw;
-        $log->info("LDAP Config aus Root Objekt uebernommen");
+        $log->info("LDAP Config aus Root Objekt der externen Datei uebernommen");
     }
 } else {
-    $log->info("Keine separate LDAP Config, nutze ldap Block aus Haupt Config");
+    $log->info("Keine separate LDAP Config Datei, nutze ldap Block aus Haupt Config");
 }
 
 # =========================
@@ -412,14 +434,14 @@ sub get_txt_records_with_cname {
 
     my $pkt = safe_dns_query($resolver, $name, "CNAME");
     return {
-        txt          => [],
+        txt          => [], 
         cname_used   => 0,
         cname_target => undef,
     } unless $pkt;
 
     my ($cname_rr) = grep { $_->type eq 'CNAME' } $pkt->answer;
     return {
-        txt          => [],
+        txt          => [], 
         cname_used   => 0,
         cname_target => undef,
     } unless $cname_rr;
@@ -461,7 +483,87 @@ sub org_domain {
 }
 
 # =========================
-# DKIM Tag Parsing
+# Hostname Validierung (MX / DKIM / SPF)
+# =========================
+
+sub _valid_hostname {
+    my ($host) = @_;
+    return 0 unless defined $host;
+    $host =~ s/\.$//;
+    return 0 if length($host) == 0 || length($host) > 253;
+
+    my @labels = split /\./, $host;
+    return 0 unless @labels >= 2;
+
+    for my $lab (@labels) {
+        return 0 if $lab eq '' || length($lab) > 63;
+        return 0 if $lab =~ /^-/ || $lab =~ /-$/;
+        return 0 unless $lab =~ /^[A-Za-z][A-Za-z0-9-]*$/;
+    }
+    return 1;
+}
+
+# =========================
+# SPF Syntax Validierung (RFC 7208, mit NetAddr::IP)
+# =========================
+
+sub validate_spf_syntax {
+    my ($spf) = @_;
+    my @errors;
+    
+    push @errors, "SPF muss mit 'v=spf1' beginnen"
+        unless $spf =~ /^v=spf1(\s|$)/i;
+    
+    my @terms = split /\s+/, $spf;
+    shift @terms if @terms && $terms[0] =~ /^v=spf1$/i;
+    
+    for my $term (@terms) {
+        next if !defined $term || $term eq '';
+        
+        my $qualifier = '';
+        if ($term =~ /^([\+\-\~\?])(.+)$/) {
+            $qualifier = $1;
+            $term      = $2;
+        }
+        
+        if ($term =~ /^(all|include|a|mx|ptr|ip4|ip6|exists)(.*)$/i) {
+            my $mech = lc($1);
+            my $rest = $2 // '';
+            
+            if ($mech eq 'ip4') {
+                if ($rest =~ /^:(.+)$/) {
+                    my $cidr = $1;
+                    my $ip   = NetAddr::IP->new($cidr);
+                    unless ($ip && $ip->version == 4) {
+                        push @errors, "Ungültige IPv4/CIDR in SPF: $cidr";
+                    }
+                }
+            }
+            elsif ($mech eq 'ip6') {
+                if ($rest =~ /^:(.+)$/) {
+                    my $cidr = $1;
+                    my $ip   = NetAddr::IP->new($cidr);
+                    unless ($ip && $ip->version == 6) {
+                        push @errors, "Ungültige IPv6/CIDR in SPF: $cidr";
+                    }
+                }
+            }
+            # include/a/mx/ptr/exists werden nur syntaktisch akzeptiert
+        }
+        elsif ($term =~ /^(redirect|exp)=/i) {
+            # bekannte Modifier, ok
+        }
+        else {
+            # SPF Macros oder unbekannte Terms werden hier nur markiert
+            push @errors, "Unbekannter oder komplexer SPF Term: $term";
+        }
+    }
+    
+    return \@errors;
+}
+
+# =========================
+# DKIM Tag Parsing / Key Validierung
 # =========================
 
 sub parse_dkim_tag_string {
@@ -507,51 +609,433 @@ sub dkim_txt_matches_expected {
     return 1;
 }
 
-# =========================
-# DKIM RFC Analyse
-# =========================
-
 sub analyze_dkim_rfc {
     my ($txt_combined) = @_;
 
     my $tags = parse_dkim_tag_string($txt_combined);
+    my @errors;
     my @warnings;
-    my $status = "ok";
+    my $status = "ok";  # ok, warn, fail
 
-    # v Tag prüfen
-    if (!defined $tags->{v} || lc($tags->{v}) ne 'dkim1') {
+    # v Tag (RFC 6376 §3.6.1)
+    if (!defined $tags->{v}) {
+        push @errors, "DKIM v Tag fehlt (RFC 6376 §3.6.1)";
         $status = "fail";
-        push @warnings, "DKIM v Tag fehlt oder ist nicht 'DKIM1'";
+    } elsif (lc($tags->{v}) ne 'dkim1') {
+        push @errors, "DKIM v Tag ist nicht 'DKIM1': " . $tags->{v};
+        $status = "fail";
     }
 
-    # p Tag prüfen
+    # p Tag - öffentlicher Schlüssel
     if (!defined $tags->{p} || $tags->{p} eq '') {
+        push @errors, "DKIM p Tag fehlt oder ist leer (Schlüssel deaktiviert/fehlt)";
         $status = "fail";
-        push @warnings, "DKIM p Tag fehlt oder ist leer (Schluessel deaktiviert)";
-    }
-
-    # k Tag prüfen, falls vorhanden
-    if (defined $tags->{k}) {
-        my $k = lc $tags->{k};
-        if ($k ne 'rsa' && $k ne 'ed25519') {
-            push @warnings, "Unbekannter DKIM k Parameter: $k";
+    } else {
+        # Detaillierte Schlüsselvalidierung
+        my $key_result = validate_dkim_key($tags->{p}, $tags->{k});
+        
+        push @errors, @{$key_result->{errors}} if $key_result->{errors};
+        push @warnings, @{$key_result->{warnings}} if $key_result->{warnings};
+        
+        # Key-Validierungs-Status überschreiben, wenn schlechter
+        if ($key_result->{status} eq 'fail' && $status ne 'fail') {
+            $status = 'fail';
+        } elsif ($key_result->{status} eq 'warn' && $status eq 'ok') {
+            $status = 'warn';
         }
     }
 
-    # t Flag (Testmodus)
-    if (defined $tags->{t} && $tags->{t} =~ /y/) {
-        push @warnings, "DKIM t Flag enthaelt 'y' (Testmodus)";
+    # k Tag - Schlüsseltyp
+    if (defined $tags->{k}) {
+        my $k = lc $tags->{k};
+        if ($k ne 'rsa' && $k ne 'ed25519') {
+            push @warnings, "Unbekannter DKIM k Parameter: $k (erwartet: rsa oder ed25519)";
+            if ($status eq "ok") {
+                $status = "warn";
+            }
+        }
+    }
+
+    # h Tag - Hash Algorithmen
+    if (defined $tags->{h}) {
+        my @algs = split /:/, lc($tags->{h});
+        my %allowed = map { $_ => 1 } qw(sha1 sha256);
+        
+        for my $alg (@algs) {
+            if (!$allowed{$alg}) {
+                push @warnings, "Unbekannter DKIM h Algorithmus: $alg (erwartet: sha1 oder sha256)";
+                if ($status eq "ok") {
+                    $status = "warn";
+                }
+            }
+        }
+        
+        # Warnung wenn nur sha1 (schwach)
+        if (@algs == 1 && $algs[0] eq 'sha1') {
+            push @warnings, "DKIM verwendet nur SHA-1 (unsicher, empfohlen: SHA-256)";
+            if ($status eq "ok") {
+                $status = "warn";
+            }
+        }
+    }
+
+    # s Tag - Service / Subdomain Signierung
+    if (defined $tags->{s}) {
+        my @svc = split /:/, lc($tags->{s});
+        for my $s (@svc) {
+            if ($s ne 'email' && $s ne '*' && $s ne 'dns') {
+                push @warnings, "Unbekannter DKIM s Parameter: $s (erwartet: email, *, dns)";
+                if ($status eq "ok") {
+                    $status = "warn";
+                }
+            }
+        }
+    }
+
+    # t Tag - Flags
+    if (defined $tags->{t}) {
+        my $t = lc $tags->{t};
+        if ($t =~ /y/) {
+            push @warnings, "DKIM t Flag enthält 'y' (Testmodus - Signaturen sollten ignoriert werden)";
+            if ($status eq "ok") {
+                $status = "warn";
+            }
+        }
+        if ($t =~ /s/) {
+            push @warnings, "DKIM t Flag enthält 's' (Strenger Modus - Subdomains müssen signieren)";
+        }
+    }
+
+    # n Tag - Notizen (nur informativ)
+    if (defined $tags->{n} && $tags->{n} ne '') {
+        # Keine Statusänderung, nur Info
+        push @warnings, "DKIM n Tag vorhanden (Notiz): '" . substr($tags->{n}, 0, 50) . "'";
+    }
+
+    # Unbekannte Tags warnen
+    my @known_tags = qw(v p k h s t n);
+    my %known = map { $_ => 1 } @known_tags;
+    
+    for my $tag (keys %$tags) {
+        if (!$known{$tag}) {
+            push @warnings, "Unbekanntes DKIM Tag: $tag";
+            if ($status eq "ok") {
+                $status = "warn";
+            }
+        }
+    }
+
+    # Zusammenfassung
+    my $detail = "DKIM RFC Analyse: $status";
+    if (@errors) {
+        $detail .= " [Fehler: " . join("; ", @errors) . "]";
+    }
+    if (@warnings) {
+        $detail .= " [Warnungen: " . join("; ", @warnings) . "]";
     }
 
     return {
         status   => $status,
+        errors   => \@errors,
         warnings => \@warnings,
+        detail   => $detail,
         tags     => $tags,
     };
 }
 
 # =========================
-# MX Check
+# DKIM Key Validation (RFC 6376/8463)
+# =========================
+
+sub validate_dkim_key {
+    my ($p_tag, $k_tag) = @_;
+    my @errors;
+    my @warnings;
+    my $status = "ok";  # ok, warn, fail
+    
+    # Grundlegende Validierung
+    unless (defined $p_tag && $p_tag ne '') {
+        push @errors, "DKIM p Tag ist leer oder undefiniert";
+        return { errors => \@errors, warnings => \@warnings, status => "fail" };
+    }
+    
+    # 1. Base64 Validierung (RFC 4648)
+    unless ($p_tag =~ m{^[A-Za-z0-9+/]+={0,2}$}) {
+        push @errors, "DKIM p Tag: ungültiges Base64 Format (RFC 4648)";
+        $status = "fail";
+        
+        # Versuche den Fehler genauer zu diagnostizieren
+        if ($p_tag =~ /[^A-Za-z0-9+\/=]/) {
+            my @invalid_chars = $p_tag =~ /([^A-Za-z0-9+\/=])/g;
+            my %unique_invalid = map { $_ => 1 } @invalid_chars;
+            push @errors, "Ungültige Zeichen im p Tag: " . join("", sort keys %unique_invalid);
+        }
+        
+        # = nur am Ende erlaubt
+        if ($p_tag =~ /=./) {
+            push @errors, "Base64 '=' Zeichen nicht nur am Ende";
+        }
+        
+        return { errors => \@errors, warnings => \@warnings, status => $status };
+    }
+    
+    # 2. Längenberechnung (Base64 zu Bytes)
+    my $base64_len = length($p_tag);
+    
+    # Entferne Padding für korrekte Berechnung
+    my $padded_len = $base64_len;
+    $padded_len-- while $padded_len > 0 && substr($p_tag, $padded_len-1, 1) eq '=';
+    
+    # Bytes = (Zeichen * 3/4), abgerundet
+    my $byte_len = int($padded_len * 3 / 4);
+    my $bit_len = $byte_len * 8;
+    
+    # Debug-Info
+    $log->debug("[DKIM Key] Base64 length: $base64_len, Byte length: $byte_len, Bit length: $bit_len");
+    
+    # 3. Schlüsseltyp bestimmen
+    my $key_type = lc($k_tag // 'rsa');
+    
+    if ($key_type eq 'rsa') {
+        # RFC 6376 §3.6.1: RSA keys of at least 1024 bits for long-lived keys
+        
+        if ($bit_len < 512) {
+            push @errors, "DKIM RSA Schlüssel extrem kurz: $bit_len bits (<512 bits)";
+            $status = "fail";
+        }
+        elsif ($bit_len < 1024) {
+            push @errors, "DKIM RSA Schlüssel zu kurz: $bit_len bits (<1024 bits, RFC 6376 §3.6.1)";
+            $status = "fail";
+        }
+        elsif ($bit_len < 2048) {
+            push @warnings, "DKIM RSA Schlüssel nur $bit_len bits (empfohlen: ≥2048 bits für bessere Sicherheit)";
+            if ($status eq "ok") {
+                $status = "warn";
+            }
+        }
+        elsif ($bit_len > 4096) {
+            push @warnings, "DKIM RSA Schlüssel sehr lang: $bit_len bits (>4096 bits, kann Performance-Probleme verursachen)";
+            if ($status eq "ok") {
+                $status = "warn";
+            }
+        }
+        
+    } elsif ($key_type eq 'ed25519') {
+        # RFC 8463: Ed25519 for DKIM
+        # Ed25519: 32 bytes = 256 bits öffentlicher Schlüssel
+        
+        if ($byte_len != 32) {
+            push @errors, "DKIM Ed25519 Schlüssel hat falsche Länge: $byte_len bytes (erwartet: 32 bytes, RFC 8463)";
+            $status = "fail";
+        }
+        
+        if ($bit_len != 256) {
+            push @errors, "DKIM Ed25519 Schlüssel hat falsche Bit-Länge: $bit_len bits (erwartet: 256 bits)";
+            $status = "fail";
+        }
+        
+    } else {
+        # Unbekannter Schlüsseltyp
+        push @warnings, "Unbekannter DKIM Schlüsseltyp: $key_type (erwartet: rsa oder ed25519)";
+        if ($status eq "ok") {
+            $status = "warn";
+        }
+        
+        # Generische Längenprüfung für unbekannte Typen
+        if ($bit_len < 256) {
+            push @warnings, "DKIM Schlüssel ($key_type) sehr kurz: $bit_len bits";
+            if ($status eq "ok") {
+                $status = "warn";
+            }
+        }
+    }
+    
+    # 4. Weitere Checks
+    
+    # Prüfe auf offensichtlich falsche Schlüssel (wie Platzhalter)
+    if ($p_tag =~ /^(?:YQ==|MTIz|AAAA)/) {  # "a==", "123", "AAA..."
+        push @warnings, "DKIM p Tag sieht aus wie Test-/Platzhalter-Daten";
+        if ($status eq "ok") {
+            $status = "warn";
+        }
+    }
+    
+    # Prüfe auf Wiederholungsmuster (könnte auf schwache Generierung hinweisen)
+    if ($base64_len > 20) {
+        my $first_half = substr($p_tag, 0, int($base64_len/2));
+        my $second_half = substr($p_tag, int($base64_len/2));
+        
+        if ($first_half eq $second_half) {
+            push @warnings, "DKIM Schlüssel zeigt Wiederholungsmuster (könnte schwach sein)";
+            if ($status eq "ok") {
+                $status = "warn";
+            }
+        }
+    }
+    
+    # 5. Rückgabe mit allen Details
+    return {
+        errors      => \@errors,
+        warnings    => \@warnings,
+        status      => $status,
+        key_type    => $key_type,
+        base64_len  => $base64_len,
+        byte_len    => $byte_len,
+        bit_len     => $bit_len,
+    };
+}
+
+
+
+# =========================
+# DMARC / URI / RFC Analyse
+# =========================
+
+sub parse_dmarc_tag {
+    my ($tagstr) = @_;
+    my %tags;
+    for my $p (split /;/, $tagstr) {
+        $p =~ s/^\s+|\s+$//g;
+        next unless $p;
+        my ($k, $v) = split /=/, $p, 2;
+        next unless defined $k and defined $v;
+        $k =~ s/^\s+|\s+$//g;
+        $v =~ s/^\s+|\s+$//g;
+        $tags{lc $k} = $v;
+    }
+    return %tags;
+}
+
+sub validate_dmarc_uri {
+    my ($uri) = @_;
+    
+    return "URI ist leer" unless $uri;
+    
+    if ($uri =~ /^mailto:([^\s!]+)$/i) {
+        my $email = $1;
+        
+        if ($email =~ /^(.+?)!(\d+[km]?)$/i) {
+            my ($addr, $size) = ($1, $2);
+            return "Ungültige Email in mailto: $addr"
+                unless $addr =~ /^[^@]+@[^@]+\.[^@]+$/;
+            if ($size =~ /^(\d+)([km]?)$/i) {
+                my ($num, $unit) = ($1, lc($2 // ''));
+                return "Size-Limit zu gross" if $num > 1000000;
+            } else {
+                return "Ungültiges Size-Limit Format: $size";
+            }
+        } else {
+            return "Ungültige Email in mailto: $email"
+                unless $email =~ /^[^@]+@[^@]+\.[^@]+$/;
+        }
+        
+        return undef;
+    }
+    
+    return "Nur mailto: URIs sind in DMARC erlaubt";
+}
+
+sub analyze_dmarc_rfc {
+    my ($tags, $rua_raw, $ruf_raw) = @_;
+    my @warnings;
+    my $status = "ok";
+
+    # pct
+    my $pct = defined $tags->{pct} ? $tags->{pct} : 100;
+    if (!defined $tags->{pct}) {
+        push @warnings, "DMARC pct nicht gesetzt, Default 100 wird angenommen";
+    } else {
+        if ($pct !~ /^\d+$/ || $pct < 0 || $pct > 100) {
+            push @warnings, "DMARC pct ausserhalb 0-100: $pct";
+            $status = "warn" if $status eq "ok";
+        }
+    }
+
+    # ri
+    if (defined $tags->{ri}) {
+        my $ri = $tags->{ri};
+        if ($ri !~ /^\d+$/ || $ri <= 0) {
+            push @warnings, "DMARC ri (Interval) ungueltig: $ri";
+            $status = "warn" if $status eq "ok";
+        } elsif ($ri < 3600) {
+            push @warnings, "DMARC ri < 3600 Sekunden (ungewoehnlich klein): $ri";
+        }
+    }
+
+    # fo
+    if (defined $tags->{fo}) {
+        my @vals = split /:/, $tags->{fo};
+        for my $v (@vals) {
+            next if $v eq '0' || $v eq '1' || $v eq 'd' || $v eq 's';
+            push @warnings, "Unbekannter DMARC fo Wert: $v";
+            $status = "warn" if $status eq "ok";
+        }
+    }
+
+    # rf
+    if (defined $tags->{rf}) {
+        my @vals = split /:/, $tags->{rf};
+        for my $v (@vals) {
+            next if lc($v) eq 'afrf';
+            push @warnings, "Unbekanntes DMARC rf Format: $v";
+            $status = "warn" if $status eq "ok";
+        }
+    }
+
+    # rua / ruf URIs
+    for my $u (@$rua_raw, @$ruf_raw) {
+        next unless defined $u && $u ne '';
+        my $err = validate_dmarc_uri($u);
+        if ($err) {
+            push @warnings, "DMARC URI '$u' ungueltig: $err";
+            $status = "warn" if $status eq "ok";
+        }
+    }
+
+    return {
+        status   => $status,
+        warnings => \@warnings,
+        pct      => $pct,
+        ri       => $tags->{ri},
+        fo       => $tags->{fo},
+        rf       => $tags->{rf},
+    };
+}
+
+sub extract_domain_from_mailto {
+    my ($uri) = @_;
+    return undef unless $uri;
+    $uri =~ s/^\s+|\s+$//g;
+    return undef unless $uri =~ /^mailto:/i;
+    my ($addr) = $uri =~ /^mailto:([^?]+)/i;
+    return undef unless $addr && $addr =~ /\@/;
+    my (undef, $dom) = split /\@/, $addr, 2;
+    $dom = lc $dom if defined $dom;
+    return $dom;
+}
+
+sub check_external_dmarc_authorization {
+    my ($resolver, $domain, $provider_domain) = @_;
+    my $name = $domain . "._report._dmarc." . $provider_domain;
+    my @txt = get_txt_records($resolver, $name);
+
+    my $authorized = 0;
+    for my $t (@txt) {
+        if ($t =~ /v=DMARC1/i) {
+            $authorized = 1;
+            last;
+        }
+    }
+
+    return {
+        fqdn        => $name,
+        authorized  => $authorized ? 1 : 0,
+        txt_records => \@txt,
+    };
+}
+
+# =========================
+# MX Check mit RFC Analyse
 # =========================
 
 sub check_mx {
@@ -559,13 +1043,28 @@ sub check_mx {
 
     my $pkt = safe_dns_query($resolver, $domain, "MX");
     my @mx_hosts;
+    my @rfc_warnings;
+    my $rfc_status = "ok";
 
     if ($pkt) {
         foreach my $rr ($pkt->answer) {
             next unless $rr->type eq "MX";
+            my $ex  = lc($rr->exchange);
+            my $pre = $rr->preference;
+
+            if (!_valid_hostname($ex)) {
+                push @rfc_warnings, "MX Hostname ungueltig: $ex";
+                $rfc_status = "warn" if $rfc_status eq "ok";
+            }
+
+            if ($pre !~ /^\d+$/) {
+                push @rfc_warnings, "MX Preference nicht numerisch fuer $ex: $pre";
+                $rfc_status = "warn" if $rfc_status eq "ok";
+            }
+
             push @mx_hosts, {
-                exchange   => lc($rr->exchange),
-                preference => $rr->preference,
+                exchange   => $ex,
+                preference => $pre,
             };
         }
     }
@@ -576,19 +1075,42 @@ sub check_mx {
 
     if (!@mx_hosts) {
         return {
-            status => "fail",
-            detail => "Keine MX Records gefunden",
-            mx     => \@mx_hosts,
-            groups => \@groups,
+            status       => "fail",
+            detail       => "Keine MX Records gefunden",
+            mx           => \@mx_hosts,
+            groups       => \@groups,
+            rfc_analysis => {
+                status    => "fail",
+                severity  => "low",
+                warnings  => ["Keine MX Records laut DNS"],
+            },
         };
     }
 
+    # MX Priority "Konflikte" (nur informativ: mehrere mit gleicher Pref)
+    my %pref_count;
+    for my $m (@mx_hosts) {
+        $pref_count{$m->{preference}}++;
+    }
+    my @multi_pref = grep { $pref_count{$_} > 1 } keys %pref_count;
+    if (@multi_pref) {
+        push @rfc_warnings, "Mehrere MX Eintraege mit gleicher Preference: "
+            . join(", ", @multi_pref);
+        $rfc_status = "warn" if $rfc_status eq "ok";
+    }
+
     if (!@groups) {
+        my $detail = "MX Records gefunden: " . join(", ", @actual_names);
         return {
-            status => "ok",
-            detail => "MX Records gefunden: " . join(", ", @actual_names),
-            mx     => \@mx_hosts,
-            groups => [],
+            status       => "ok",
+            detail       => $detail,
+            mx           => \@mx_hosts,
+            groups       => [],
+            rfc_analysis => {
+                status    => $rfc_status,
+                severity  => "low",
+                warnings  => \@rfc_warnings,
+            },
         };
     }
 
@@ -654,10 +1176,15 @@ sub check_mx {
         : "Keine MX Profilgruppe wurde vollstaendig erfuellt";
 
     return {
-        status => $overall_status,
-        detail => $detail,
-        mx     => \@mx_hosts,
-        groups => \@group_results,
+        status       => $overall_status,
+        detail       => $detail,
+        mx           => \@mx_hosts,
+        groups       => \@group_results,
+        rfc_analysis => {
+            status    => $rfc_status,
+            severity  => "low",
+            warnings  => \@rfc_warnings,
+        },
     };
 }
 
@@ -668,38 +1195,49 @@ sub check_mx {
 sub analyze_spf_recursion {
     my ($resolver, $domain, $stats, $seen) = @_;
     
-    # $stats = { lookups => 0, void_lookups => 0, warnings => [], path => [] }
-    # $seen  = { domain => 1 } (Loop Prevention)
+    # $stats = { lookups => 0, void_lookups => 0, redirects => 0, warnings => [], path => [], multiple_spf => 0 }
+    # $seen  = { domain => 1 }
 
-    # Loop Detection
+    # Prüfe auf Zyklus/Recursion
     if ($seen->{$domain}) {
-        push @{$stats->{warnings}}, "SPF Loop entdeckt bei Domain: $domain";
+        push @{$stats->{warnings}}, "SPF Loop entdeckt bei Domain: $domain (Zyklus: " . join(" -> ", @{$stats->{path}}, $domain) . ")";
+        $stats->{has_loop} = 1;
         return;
     }
+    
     $seen->{$domain} = 1;
     push @{$stats->{path}}, $domain;
 
-    # Rekursions Tiefe Sicherheit
+    # Maximal 10 Ebenen Tiefe (zusätzliche Sicherheit)
     if (scalar(@{$stats->{path}}) > 10) {
         push @{$stats->{warnings}}, "SPF Rekursion zu tief (>10 Ebenen) bei $domain";
+        $stats->{too_deep} = 1;
         return;
     }
 
     my @txt = get_txt_records($resolver, $domain);
     my @spf_records = grep { /^v=spf1(\s|$)/i } @txt;
 
+    # Kein SPF Record = Void Lookup
     if (!@spf_records) {
+        $stats->{void_lookups}++;
         return;
     }
     
-    # RFC 7208: Es darf nur ein SPF Record existieren
+    # Mehrere SPF Records = PermError (wird in check_spf behandelt)
     if (@spf_records > 1) {
-         push @{$stats->{warnings}}, "Mehrere SPF Records gefunden bei $domain";
-         return;
+        push @{$stats->{warnings}}, "Mehrere SPF Records gefunden bei $domain";
+        $stats->{multiple_spf} = 1;
+        return;  # Bei mehreren SPF Records weiter zu analysieren macht keinen Sinn
     }
 
     my $spf_string = $spf_records[0];
     my @terms = split /\s+/, $spf_string;
+    
+    # Debug: Logge SPF String bei Bedarf
+    if ($log->is_debug()) {
+        $log->debug("[SPF Analysis] Domain: $domain, SPF: " . substr($spf_string, 0, 100) . "...");
+    }
     
     foreach my $term (@terms) {
         next if $term =~ /^v=spf1$/i;
@@ -711,17 +1249,40 @@ sub analyze_spf_recursion {
         if ($clean_term =~ /^include:(.*)/i) {
             $stats->{lookups}++;
             my $target = $1;
-            analyze_spf_recursion($resolver, $target, $stats, { %$seen });
+            
+            # Prüfe ob Target eine gültige Domain ist
+            if ($target =~ /^[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?)*$/i) {
+                analyze_spf_recursion($resolver, $target, $stats, { %$seen });
+            } else {
+                push @{$stats->{warnings}}, "Ungültiges include Target in SPF: $target";
+            }
         }
         elsif ($clean_term =~ /^redirect=(.*)/i) {
             $stats->{lookups}++;
+            $stats->{redirects}++;
             my $target = $1;
-            analyze_spf_recursion($resolver, $target, $stats, $seen);
-            last;
+            
+            if ($target =~ /^[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?)*$/i) {
+                analyze_spf_recursion($resolver, $target, $stats, $seen);
+            } else {
+                push @{$stats->{warnings}}, "Ungültiges redirect Target in SPF: $target";
+            }
+            last;  # redirect bricht Auswertung ab
         }
         elsif ($clean_term =~ /^(?:a|mx|ptr|exists)(?:[:\/]|$)/i) {
             $stats->{lookups}++;
+            
+            # Für a:/mx:/ptr:/exists: extrahiere optionalen Parameter
+            if ($clean_term =~ /^(a|mx|ptr|exists):(.+)/i) {
+                my ($mech, $param) = ($1, $2);
+                # Bei a:/mx: können Domains als Parameter enthalten sein
+                if ($mech =~ /^(a|mx)$/i && $param =~ /^[a-z0-9]/i) {
+                    # Hier könnte man weitere Analyse hinzufügen
+                    $log->debug("[SPF] Mechanismus $mech mit Parameter: $param");
+                }
+            }
         }
+        # ignoriere "all" und andere nicht-DNS Mechs
     }
 }
 
@@ -733,7 +1294,6 @@ sub check_spf {
         ? ($profile->{require_spf} ? 1 : 0)
         : $GLOBAL_REQUIRE_SPF;
 
-    # 1. Basis Check: Record holen
     my @txt = get_txt_records($resolver, $domain);
     my @spf_all = grep { /^v=spf1(\s|$)/i } @txt;
 
@@ -757,40 +1317,119 @@ sub check_spf {
         $mode = "no-all";
     }
 
-    # 2. Deep Analysis (RFC 7208 Lookup Count & Recursion)
+    # RFC 7208 STRENGE PRÜFUNGEN
+    my @rfc_errors;
+    my @rfc_warnings;
+    my $rfc_status = "ok";  # ok, warn, fail
+    
+    # A) Prüfe TXT Record Längen (RFC 7208 §12.1)
+    for my $spf_record (@spf_all) {
+        if (length($spf_record) > 255) {
+            push @rfc_errors, "SPF TXT Record >255 Bytes (RFC 7208 §12.1 Limit)";
+            $rfc_status = "fail";
+        }
+    }
+
+    # B) Deep Analysis für Lookup Limits
     my $analysis_stats = {
-        lookups  => 0,
-        warnings => [],
-        path     => [],
+        lookups      => 0,
+        void_lookups => 0,
+        redirects    => 0,
+        warnings     => [],
+        path         => [],
+        multiple_spf => 0,
     };
     
     if (@spf_all) {
         analyze_spf_recursion($resolver, $domain, $analysis_stats, {});
     }
 
-    # 3. Profil Prüfung (Gruppen)
+    # C) Mehrere SPF Records = PermError (RFC 7208 §3.2)
+    if (@spf_all > 1) {
+        push @rfc_errors, "Mehrere SPF Records gefunden (RFC 7208 §3.2 PermError)";
+        $rfc_status = "fail";
+        $analysis_stats->{multiple_spf} = 1;
+    }
+
+    # D) DNS Lookup Limit >10 = PermError (RFC 7208 §4.6.4)
+    if ($analysis_stats->{lookups} > 10) {
+        push @rfc_errors, "SPF DNS-Lookups >10 ($analysis_stats->{lookups}) (RFC 7208 §4.6.4 PermError)";
+        $rfc_status = "fail";
+    }
+
+    # E) Void Lookup Limit >2 = PermError (RFC 7208 §4.6.4)
+    if ($analysis_stats->{void_lookups} > 2) {
+        push @rfc_errors, "SPF Void-Lookups >2 ($analysis_stats->{void_lookups}) (RFC 7208 §4.6.4 PermError)";
+        $rfc_status = "fail";
+    }
+
+    # F) Mehr als ein redirect= (nicht direkt RFC, aber schlechte Praxis)
+    if ($analysis_stats->{redirects} > 1) {
+        push @rfc_warnings, "Mehr als ein redirect= in SPF Struktur gefunden";
+        if ($rfc_status eq "ok") {
+            $rfc_status = "warn";
+        }
+    }
+
+    # G) SPF ohne "all" Mechanismus (nicht RFC-verpflichtend, aber empfohlen)
+    if (!$has_all && $mode ne 'redirect' && @spf_all) {
+        push @rfc_warnings, "SPF ohne 'all' Mechanismus (kann zu unerwartetem Verhalten führen)";
+        if ($rfc_status eq "ok") {
+            $rfc_status = "warn";
+        }
+    }
+
+    # H) Syntax Prüfung mit NetAddr::IP
+    my $syntax_errors = [];
+    if ($spf_orig) {
+        $syntax_errors = validate_spf_syntax($spf_orig);
+        if (@$syntax_errors) {
+            push @rfc_warnings, "SPF Syntax-Warnungen: " . join("; ", @$syntax_errors);
+            if ($rfc_status eq "ok" && @$syntax_errors) {
+                $rfc_status = "warn";
+            }
+        }
+    }
+
+    # I) Struktur-Warnungen aus der Analyse
+    if (@{$analysis_stats->{warnings}}) {
+        push @rfc_warnings, "SPF Struktur: " . join("; ", @{$analysis_stats->{warnings}});
+        if ($rfc_status eq "ok") {
+            $rfc_status = "warn";
+        }
+    }
+
+    # J) SPF Makros prüfen (RFC 7208 §7)
+    if ($spf_orig && $spf_orig =~ /%\{/) {
+        # Erkennte gängige Makros
+        my @macros = $spf_orig =~ /%\{([^}]+)\}/g;
+        my %seen_macros;
+        for my $macro (@macros) {
+            $seen_macros{$macro}++;
+        }
+        
+        if (keys %seen_macros) {
+            push @rfc_warnings, "SPF enthält Makros: " . join(", ", sort keys %seen_macros);
+            if ($rfc_status eq "ok") {
+                $rfc_status = "warn";  # Makros sind komplex
+            }
+        }
+    }
+
     my $groups_conf   = $spf_policy->{groups}   || {};
     my $defaults_conf = $spf_policy->{defaults} || {};
     my @groups        = ref $groups_conf eq 'ARRAY' ? @$groups_conf : ();
     
-    my $status;
+    my $policy_status;   # Status aus Policy-Check
     my $detail;
     my @group_results;
-    my @notes;
-
-    if ($analysis_stats->{lookups} > 10) {
-        push @notes, "CRITICAL: SPF Lookup Limit ueberschritten (" . $analysis_stats->{lookups} . " > 10). SPF ist ungueltig (PermError)";
-    }
-    if (@{$analysis_stats->{warnings}}) {
-        push @notes, "SPF Struktur Warnungen: " . join("; ", @{$analysis_stats->{warnings}});
-    }
 
     if (!@spf_all && !@groups) {
         if ($require_spf) {
-            $status = "fail";
+            $policy_status = "fail";
             $detail = "Kein SPF Record vorhanden (require_spf=1)";
         } else {
-            $status = "warn";
+            $policy_status = "warn";
             $detail = "Kein SPF Record vorhanden (require_spf=0)";
         }
     } elsif (@groups) {
@@ -826,87 +1465,76 @@ sub check_spf {
                 $overall_status = 'ok';
             }
         }
-        $status = $overall_status;
+        $policy_status = $overall_status;
         $detail = "SPF Profil Check (Modus $mode)";
     } else {
-        $status = "ok";
+        $policy_status = "ok";
         $detail = "SPF vorhanden (Modus $mode)";
         if ($mode eq 'open' && $defaults_conf->{forbid_open}) {
-            $status = "fail";
+            $policy_status = "fail";
             $detail = "SPF Modus open verboten";
         }
     }
 
-    if ($analysis_stats->{lookups} > 10) {
-        $status = "fail";
-        $detail .= " [RFC VIOLATION: >10 Lookups]";
+    # FINALER STATUS: RFC-Fehler haben Vorrang vor Policy-Check!
+    my $final_status;
+    my @final_notes;
+    
+    if ($rfc_status eq "fail") {
+        $final_status = "fail";
+        push @final_notes, "RFC-Verletzung";
+        $detail = "SPF ungültig (RFC 7208): " . join("; ", @rfc_errors);
+    } else {
+        # Keine RFC-Fehler, verwende Policy-Status
+        $final_status = $policy_status;
+        
+        # RFC-Warnungen zu Detail hinzufügen
+        if (@rfc_warnings) {
+            push @final_notes, "RFC-Hinweise: " . join("; ", @rfc_warnings);
+        }
+        
+        # Policy-Detail behalten
+        if ($policy_status eq "fail") {
+            push @final_notes, "Policy-Verletzung";
+        }
     }
 
-    if (@notes) {
-        $detail .= " (" . join("; ", @notes) . ")";
+    # Alle Notizen kombinieren
+    if (@final_notes) {
+        $detail .= " [" . join("; ", @final_notes) . "]";
     }
+
+    # Void-Lookup und Lookup Limits als separate Flags
+    my $has_void_lookup_limit = ($analysis_stats->{void_lookups} > 2) ? 1 : 0;
+    my $has_lookup_limit = ($analysis_stats->{lookups} > 10) ? 1 : 0;
+    my $has_multiple_spf = $analysis_stats->{multiple_spf};
 
     return {
-        status       => $status,
+        status       => $final_status,
         detail       => $detail,
         require_spf  => $require_spf + 0,
         raw_original => \@spf_all,
         mode         => $mode,
-        rfc_analysis => $analysis_stats,
+        rfc_analysis => {
+            status               => $rfc_status,
+            errors               => \@rfc_errors,
+            warnings             => \@rfc_warnings,
+            lookups              => $analysis_stats->{lookups},
+            void_lookups         => $analysis_stats->{void_lookups},
+            redirects            => $analysis_stats->{redirects},
+            has_void_lookup_limit=> $has_void_lookup_limit,
+            has_lookup_limit     => $has_lookup_limit,
+            has_multiple_spf     => $has_multiple_spf,
+            syntax_errors        => $syntax_errors,
+            path                 => $analysis_stats->{path},
+        },
         groups       => \@group_results,
     };
 }
 
 # =========================
-# DMARC Check
+# DMARC Check (mit RFC Analyse)
 # =========================
-
-sub parse_dmarc_tag {
-    my ($tagstr) = @_;
-    my %tags;
-    for my $p (split /;/, $tagstr) {
-        $p =~ s/^\s+|\s+$//g;
-        next unless $p;
-        my ($k, $v) = split /=/, $p, 2;
-        next unless defined $k and defined $v;
-        $k =~ s/^\s+|\s+$//g;
-        $v =~ s/^\s+|\s+$//g;
-        $tags{lc $k} = $v;
-    }
-    return %tags;
-}
-
-sub extract_domain_from_mailto {
-    my ($uri) = @_;
-    return undef unless $uri;
-    $uri =~ s/^\s+|\s+$//g;
-    return undef unless $uri =~ /^mailto:/i;
-    my ($addr) = $uri =~ /^mailto:([^?]+)/i;
-    return undef unless $addr && $addr =~ /\@/;
-    my (undef, $dom) = split /\@/, $addr, 2;
-    $dom = lc $dom if defined $dom;
-    return $dom;
-}
-
-sub check_external_dmarc_authorization {
-    my ($resolver, $domain, $provider_domain) = @_;
-    my $name = $domain . "._report._dmarc." . $provider_domain;
-    my @txt = get_txt_records($resolver, $name);
-
-    my $authorized = 0;
-    for my $t (@txt) {
-        if ($t =~ /v=DMARC1/i) {
-            $authorized = 1;
-            last;
-        }
-    }
-
-    return {
-        fqdn        => $name,
-        authorized  => $authorized ? 1 : 0,
-        txt_records => \@txt,
-    };
-}
 
 sub check_dmarc {
     my ($resolver, $domain, $profile, $global_dmarc_policy) = @_;
@@ -962,11 +1590,13 @@ sub check_dmarc {
     }
 
     my $rua         = $tags{rua} // "";
+    my $ruf         = $tags{ruf} // "";
     my $require_rua = exists $dmarc_policy->{require_rua}
         ? ($dmarc_policy->{require_rua} ? 1 : 0)
         : 1;
 
-    my @rua_raw = split /,/, $rua;
+    my @rua_raw = $rua ? split /,/, $rua : ();
+    my @ruf_raw = $ruf ? split /,/, $ruf : ();
     my @rua_domains;
     for my $r (@rua_raw) {
         my $d = extract_domain_from_mailto($r);
@@ -1057,8 +1687,16 @@ sub check_dmarc {
         }
     }
 
+    my $rfc = analyze_dmarc_rfc(\%tags, \@rua_raw, \@ruf_raw);
+    if ($rfc->{status} eq 'warn' && $status eq 'ok') {
+        $status = 'warn';
+    }
+
     my $detail = "DMARC ok";
     $detail .= " (" . join(", ", @notes) . ")" if @notes;
+    if (@{$rfc->{warnings}}) {
+        $detail .= " [DMARC RFC Hinweise: " . join("; ", @{$rfc->{warnings}}) . "]";
+    }
 
     return {
         status           => $status,
@@ -1079,6 +1717,7 @@ sub check_dmarc {
             require_external_authorization => $require_auth + 0,
             external_details               => \@external_details,
         },
+        rfc_analysis     => $rfc,
     };
 }
 
@@ -1189,9 +1828,9 @@ sub check_dkim {
 
                 if (@missing_parts) {
                     if ($require_dkim) {
-                        $sel_status = "fail";
+                        $sel_status = 'fail';
                     } else {
-                        $sel_status = "warn";
+                        $sel_status = 'warn';
                     }
                 }
 
@@ -1203,11 +1842,10 @@ sub check_dkim {
                 });
             }
 
-            # RFC Analyse einbauen
             my $rfc = analyze_dkim_rfc($txt_combined);
 
             if ($rfc->{status} eq 'fail') {
-                $sel_status = 'fail' if $sel_status ne 'fail';
+                $sel_status = 'fail';
             }
 
             my @notes;
@@ -1458,10 +2096,20 @@ for my $dom_result (@results) {
     }
 }
 
+# Datum für Report-Datei
+my $date_str = strftime("%Y%m%d", localtime);
+my $json_target = $JSON_FILE;
+if ($json_target =~ /(.*)\.json$/i) {
+    $json_target = $1 . "_" . $date_str . ".json";
+} else {
+    $json_target = $json_target . "_" . $date_str;
+}
+
 my $summary = {
     timestamp     => strftime("%Y-%m-%dT%H:%M:%S", localtime),
     config_file   => $config_file,
     tool_version  => $VERSION,
+    report_file   => $json_target,
     global_status => $global_status,
     domains_total => scalar(@domains),
     results       => \@results,
@@ -1472,16 +2120,16 @@ if ($opt_dry_run) {
 } else {
     eval {
         my $json = encode_json($summary);
-        my ($vol, $dir, undef) = File::Spec->splitpath($JSON_FILE);
+        my ($vol, $dir, undef) = File::Spec->splitpath($json_target);
         my $path_dir = File::Spec->catpath($vol, $dir, "");
         if ($path_dir && !-d $path_dir) {
             mkdir $path_dir or die "Kann Verzeichnis nicht erstellen: $path_dir: $!";
         }
-        open my $fh, ">:encoding(UTF-8)", $JSON_FILE
-          or die "Kann JSON File nicht schreiben: $JSON_FILE: $!";
-        print {$fh} $json or die "Fehler beim Schreiben in $JSON_FILE: $!";
-        close $fh or warn "Fehler beim Schliessen von $JSON_FILE: $!";
-        $log->info("JSON Report nach $JSON_FILE geschrieben");
+        open my $fh, ">:encoding(UTF-8)", $json_target
+          or die "Kann JSON File nicht schreiben: $json_target: $!";
+        print {$fh} $json or die "Fehler beim Schreiben in $json_target: $!";
+        close $fh or warn "Fehler beim Schliessen von $json_target: $!";
+        $log->info("JSON Report nach $json_target geschrieben");
     };
     if ($@) {
         $log->error("Fehler beim Schreiben des JSON Reports: $@");
@@ -1489,7 +2137,7 @@ if ($opt_dry_run) {
 }
 
 $log->info("Fertig, globaler Status: $global_status (Version $VERSION)");
-print "domain_dns_audit v$VERSION: $global_status (Domains: " . scalar(@domains) . ")\n";
+print "domain_dns_audit v$VERSION: $global_status (Domains: " . scalar(@domains) . ", Report: $json_target)\n";
 
 if ($global_status eq "ok") {
     exit 0;
