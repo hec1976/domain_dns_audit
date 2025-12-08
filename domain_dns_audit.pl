@@ -332,19 +332,29 @@ sub fetch_domains_from_ldap {
     my @uris = @LDAP_URIS;
     die "ldap.uri oder ldap.uris fehlt in LDAP Config\n" unless @uris;
 
-    my $bind_dn     = $ldap_conf->{bind_dn}     || "";
-    my $bind_pw     = $ldap_conf->{bind_pw}     || "";
-    my $base_dn     = $ldap_conf->{base_dn}     || die "ldap.base_dn fehlt in LDAP Config\n";
-    my $filter      = $ldap_conf->{filter}      || "(objectClass=*)";
-    my $attr_domain = $ldap_conf->{attr_domain} || "associatedDomain";
+    my $bind_dn = $ldap_conf->{bind_dn}     || "";
+    my $bind_pw = $ldap_conf->{bind_pw}     || "";
+    my $base_dn = $ldap_conf->{base_dn}     || die "ldap.base_dn fehlt in LDAP Config\n";
+    my $filter  = $ldap_conf->{filter}      || "(objectClass=*)";
+
+    # NEU: mehrere Attribute erlauben (Liste oder Komma-getrennt)
+    my @attr_domains = _as_list(
+        defined $ldap_conf->{attr_domain}
+            ? $ldap_conf->{attr_domain}
+            : "associatedDomain"
+    );
+    @attr_domains = ("associatedDomain") unless @attr_domains;
 
     my $last_err;
     my $ldap;
     my $mesg;
 
-    URI_LOOP:
+URI_LOOP:
     for my $uri (@uris) {
-        $log->info("Versuche LDAP Server: $uri (BaseDN=$base_dn, Filter=$filter, Attr=$attr_domain)");
+        $log->info(
+            "Versuche LDAP Server: $uri "
+            . "(BaseDN=$base_dn, Filter=$filter, Attrs=" . join(",", @attr_domains) . ")"
+        );
 
         $ldap = Net::LDAP->new($uri, timeout => 10);
         if (!$ldap) {
@@ -374,11 +384,12 @@ sub fetch_domains_from_ldap {
     die "Keiner der LDAP Server erreichbar oder bindbar: $last_err\n"
         unless $ldap;
 
+    # NEU: alle konfigurierten Attribute holen
     $mesg = $ldap->search(
         base   => $base_dn,
         scope  => 'sub',
         filter => $filter,
-        attrs  => [$attr_domain],
+        attrs  => \@attr_domains,
     );
 
     if ($mesg->code) {
@@ -388,14 +399,19 @@ sub fetch_domains_from_ldap {
     }
 
     my %domains;
+
     foreach my $entry ($mesg->entries) {
-        my @vals = $entry->get_value($attr_domain);
-        for my $d (@vals) {
-            next unless defined $d;
-            $d =~ s/^\s+|\s+$//g;
-            next unless $d;
-            $d = lc $d;
-            $domains{$d} = 1;
+
+        # alle konfigurierten Attribute durchgehen
+        for my $attr (@attr_domains) {
+            my @vals = $entry->get_value($attr);
+            for my $d (@vals) {
+                next unless defined $d;
+                $d =~ s/^\s+|\s+$//g;
+                next unless $d;
+                $d = lc $d;
+                $domains{$d} = 1;
+            }
         }
     }
 
@@ -405,6 +421,7 @@ sub fetch_domains_from_ldap {
     $log->info("LDAP Domains gefunden: " . scalar(@dom_list));
     return @dom_list;
 }
+
 
 sub get_txt_records {
     my ($resolver, $name) = @_;
