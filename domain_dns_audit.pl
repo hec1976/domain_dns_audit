@@ -411,10 +411,19 @@ sub get_txt_records {
     my $pkt = safe_dns_query($resolver, $name, "TXT");
     return () unless $pkt;
     my @txt;
+
     foreach my $rr ($pkt->answer) {
         next unless $rr->type eq "TXT";
-        push @txt, $rr->txtdata;
+
+        # txtdata liefert in Listkontext alle Teilstrings
+        my @parts = $rr->txtdata;
+
+        # Fuer DKIM/SPF/DMARC wollen wir den logischen Gesamtstring
+        my $full = join('', @parts);
+
+        push @txt, $full;
     }
+
     return @txt;
 }
 
