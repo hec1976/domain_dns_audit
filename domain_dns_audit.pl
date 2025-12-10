@@ -447,36 +447,31 @@ sub get_txt_records {
 sub get_txt_records_with_cname {
     my ($resolver, $name) = @_;
 
+    # 1. TXT holen (kann über CNAME aufgeloest werden)
     my @txt = get_txt_records($resolver, $name);
-    if (@txt) {
-        return {
-            txt          => \@txt,
-            cname_used   => 0,
-            cname_target => undef,
-        };
+
+    # 2. CNAME immer explizit prüfen
+    my $pkt = safe_dns_query($resolver, $name, "CNAME");
+    my $cname_used   = 0;
+    my $cname_target = undef;
+
+    if ($pkt) {
+        my ($cname_rr) = grep { $_->type eq 'CNAME' } $pkt->answer;
+        if ($cname_rr) {
+            $cname_used   = 1;
+            $cname_target = $cname_rr->cname;
+
+            # Falls am Alias selbst keine TXT waren, TXT am Target nachladen
+            if (!@txt) {
+                @txt = get_txt_records($resolver, $cname_target);
+            }
+        }
     }
 
-    my $pkt = safe_dns_query($resolver, $name, "CNAME");
     return {
-        txt          => [],
-        cname_used   => 0,
-        cname_target => undef,
-    } unless $pkt;
-
-    my ($cname_rr) = grep { $_->type eq 'CNAME' } $pkt->answer;
-    return {
-        txt          => [],
-        cname_used   => 0,
-        cname_target => undef,
-    } unless $cname_rr;
-
-    my $target = $cname_rr->cname;
-    my @txt2 = get_txt_records($resolver, $target);
-
-    return {
-        txt          => \@txt2,
-        cname_used   => 1,
-        cname_target => $target,
+        txt          => \@txt,
+        cname_used   => $cname_used,
+        cname_target => $cname_target,
     };
 }
 
