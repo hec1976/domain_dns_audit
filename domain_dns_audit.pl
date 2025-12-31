@@ -1,2211 +1,1352 @@
 #!/usr/bin/perl
-
 use strict;
 use warnings;
 use utf8;
 use open qw(:std :utf8);
 
-use Net::LDAP;
-use Net::LDAP::Util qw(ldap_error_text);
+use IPC::Open2;
 use Net::DNS;
-use JSON::MaybeXS qw(encode_json decode_json JSON);
+use JSON::MaybeXS qw(encode_json decode_json);
 use Log::Log4perl;
 use POSIX qw(strftime);
-use FindBin;
-use File::Spec;
-use File::Path ();
-use Getopt::Long;
-use Domain::PublicSuffix;
+use File::Path qw(make_path);
+use File::Basename qw(dirname basename);
+use File::Temp qw(tempfile);
+use Getopt::Long qw(GetOptions);
 use Parallel::ForkManager;
-use Time::Out qw(timeout);
-use NetAddr::IP;
+use Time::HiRes qw(sleep);
+use Try::Tiny;
+use HTTP::Tiny;
+use FindBin qw($Bin);
+use File::Spec;
+use Cwd qw(abs_path);
 
-# =========================
-# Version / Konstanten
-# =========================
+# --- Konstanten ---
+use constant {
+    VERSION             => "2.6.7",
+    MAX_SPF_LOOKUPS     => 10,
+    MAX_CNAME_HOPS      => 5,
+    MAX_DNS_RETRIES     => 2,
+    DEFAULT_DNS_TIMEOUT => 10,
+    MAX_HTTP_REDIRECTS  => 5,
+    MIN_RSA_KEY_BITS    => 2048,
+};
 
-my $VERSION             = '1.1.0';
-my $SCRIPT_DIR          = $FindBin::Bin;
-my $DEFAULT_CONFIG      = File::Spec->catfile($SCRIPT_DIR, 'domain_dns_audit.json');
-my $DEFAULT_LDAP_CONFIG = File::Spec->catfile($SCRIPT_DIR, 'domain_dns_ldap.json');
+# --- Globale Pfade ---
+my $BASE = abs_path($Bin) || $Bin;
+my $DEFAULT_CONFIG = File::Spec->catfile($BASE, "config", "domain_dns_audit.json");
 
-# =========================
-# CLI Optionen
-# =========================
-
-my $opt_config;
-my $opt_ldap_config;
-my $opt_debug    = 0;
-my $opt_domain;
-my $opt_help     = 0;
-my $opt_dry_run  = 0;
-my $opt_max_procs;
-my $opt_version  = 0;
-
+# --- CLI-Optionen ---
+my ($opt_domain, $opt_config, $opt_debug, $opt_dry_run, $opt_version, $opt_help, $opt_max_procs, $opt_fast);
 GetOptions(
-    'config=s'      => \$opt_config,      # Pfad zur JSON Config (DNS/Checks)
-    'ldap-config=s' => \$opt_ldap_config, # separates LDAP Config File (optional)
-    'debug'         => \$opt_debug,       # Debug Logging aktivieren
-    'domain=s'      => \$opt_domain,      # nur eine Domain pruefen
-    'dry-run'       => \$opt_dry_run,     # kein JSON schreiben, nur Log + Exitcode
-    'max-procs=i'   => \$opt_max_procs,   # Anzahl paralleler Prozesse
-    'version'       => \$opt_version,     # Version ausgeben
-    'help'          => \$opt_help,        # Hilfe anzeigen
-) or die "Fehler beim Parsen der Optionen. Verwende --help fuer Hilfe.\n";
+    'domain=s'    => \$opt_domain,
+    'config=s'    => \$opt_config,
+    'debug'       => \$opt_debug,
+    'dry-run'     => \$opt_dry_run,
+    'max-procs=i' => \$opt_max_procs,
+    'fast'        => \$opt_fast,
+    'version'     => \$opt_version,
+    'help'        => \$opt_help,
+) or die "Ungültige Parameter. Nutze --help\n";
 
+# --- Hilfe & Version ---
 if ($opt_help) {
     print <<"USAGE";
-Verwendung: $0 [--config FILE] [--ldap-config FILE] [--domain DOMAIN] [--debug]
-                [--max-procs N] [--dry-run] [--version]
+domain_dns_audit.pl v@{[VERSION]} (HEC Edition)
 
 Optionen:
-  --config FILE       Pfad zur JSON Konfiguration (Default: $DEFAULT_CONFIG)
-                      (DNS, Domains, Checks, Output usw.)
-  --ldap-config FILE  Separates JSON nur fuer LDAP (optional).
-                      Default Reihenfolge:
-                        1) --ldap-config
-                        2) ldap.ldapconfigpath in Haupt Config
-                        3) $DEFAULT_LDAP_CONFIG (falls vorhanden)
-                        4) ldap Block aus Haupt Config
+  --domain <domain>     Nur diese Domain prüfen
+  --config <file>       Pfad zur JSON-Konfiguration (default: $DEFAULT_CONFIG)
+  --debug               Debug-Logging aktivieren
+  --dry-run             Kein Report schreiben (nur Prüfung)
+  --max-procs <n>       Parallelität (default: runtime.max_procs)
+  --fast                Schnellmodus: DANE/MTA-STS nur wenn im Profil 'require=true'
+  --version             Version anzeigen
+  --help                Diese Hilfe anzeigen
 
-  --domain DOMAIN     Nur diese eine Domain pruefen (LDAP/extra_domains werden ignoriert)
-  --debug             Log Level DEBUG aktivieren
-
-  --max-procs N       Anzahl paralleler Prozesse (Default: runtime.max_procs oder 20)
-  --dry-run           Kein JSON Report schreiben, nur Log / Exitcode
-  --version           Version von domain_dns_audit anzeigen
-  --help              Diese Hilfe anzeigen
-
-Beispiele:
-  $0
-  $0 --config /etc/mmbb/domain_dns_audit.json
-  $0 --config /etc/mmbb/domain_dns_audit.json --ldap-config /etc/mmbb/domain_dns_ldap.json
-  $0 --domain example.ch --debug
-  $0 --max-procs 10 --dry-run
 USAGE
     exit 0;
 }
 
 if ($opt_version) {
-    print "domain_dns_audit Version $VERSION\n";
+    print "domain_dns_audit Version @{[VERSION]}\n";
     exit 0;
 }
 
-# =========================
-# Konfiguration laden
-# =========================
+# --- Globale Variablen ---
+my ($log, $conf, $PROFILE_CONF, $DNS_CONF, $DOMAINS_CONF, $OUT_CONF, $RUNTIME_CONF);
+my ($MAX_PROCS, %DNS_CACHE, $PSL_REF); 
 
-my $config_file = $opt_config || $DEFAULT_CONFIG;
-die "Config file does not exist: $config_file" unless -f $config_file;
-
-open my $cfh, '<:raw', $config_file
-  or die "Kann Config nicht oeffnen: $config_file: $!";
-
-local $/;
-my $config_json = <$cfh>;
-close $cfh;
-
-my $json_parser = JSON->new->utf8->relaxed->allow_nonref;
-my $conf = eval {
-    $json_parser->decode($config_json);
-};
-
-if ($@) {
-    chomp $@;
-    die "Fehler beim Parsen der JSON Config $config_file: $@\n";
+# --- Helferfunktionen ---
+sub _trim {
+    my ($s) = @_;
+    $s //= "";
+    $s =~ s/^\s+|\s+$//g;
+    return $s;
 }
-die "Config $config_file ist kein JSON Objekt\n" unless ref $conf eq 'HASH';
-
-# Haupt Config Bereiche
-my $ldap_conf    = $conf->{ldap}    || {};
-my $check_conf   = $conf->{check}   || {};
-my $out_conf     = $conf->{output}  || {};
-my $dns_conf     = $conf->{dns}     || {};
-my $dom_conf     = $conf->{domains} || {};
-my $runtime_conf = $conf->{runtime} || {};
-
-# =========================
-# Logging
-# =========================
-
-my $LOG_FILE  = $out_conf->{log_file}  || "/var/log/mmbb/domain_dns_audit.log";
-my $JSON_FILE = $out_conf->{json_file} || "/var/log/mmbb/domain_dns_audit.json";
-my $LOG_LEVEL = $out_conf->{log_level} || "INFO";
-
-if ($opt_debug) {
-    $LOG_LEVEL = "DEBUG";
-}
-
-my $log_conf = qq(
-    log4perl.logger                    = $LOG_LEVEL, LOGFILE
-    log4perl.appender.LOGFILE          = Log::Log4perl::Appender::File
-    log4perl.appender.LOGFILE.filename = $LOG_FILE
-    log4perl.appender.LOGFILE.layout   = Log::Log4perl::Layout::PatternLayout
-    log4perl.appender.LOGFILE.layout.ConversionPattern = %d [%p] [%P] %m%n
-    log4perl.appender.LOGFILE.binmode  = :encoding(UTF-8)
-);
-
-Log::Log4perl::init(\$log_conf);
-my $log = Log::Log4perl->get_logger();
-
-$log->info("Start domain_dns_audit Version $VERSION mit Config $config_file");
-$log->info("CLI: debug=$opt_debug, domain=" . ($opt_domain // '') . ", dry_run=$opt_dry_run");
-
-# =========================
-# LDAP Config extern / Default
-# =========================
-
-my $ldap_config_file;
-
-# 1. CLI
-if (defined $opt_ldap_config) {
-    $ldap_config_file = $opt_ldap_config;
-    $log->info("LDAP Config per CLI gesetzt: $ldap_config_file");
-}
-# 2. Pfad aus Hauptconfig
-elsif (defined $ldap_conf->{ldapconfigpath} && $ldap_conf->{ldapconfigpath} ne '') {
-    $ldap_config_file = $ldap_conf->{ldapconfigpath};
-    $log->info("LDAP Config aus Haupt Config (ldap.ldapconfigpath): $ldap_config_file");
-}
-# 3. Default im Scriptverzeichnis
-elsif (-e $DEFAULT_LDAP_CONFIG) {
-    $ldap_config_file = $DEFAULT_LDAP_CONFIG;
-    $log->info("Verwende Default LDAP Config: $ldap_config_file");
-}
-
-if ($ldap_config_file) {
-    open my $lfh, '<:utf8', $ldap_config_file
-      or die "Kann LDAP Config nicht oeffnen: $ldap_config_file: $!";
-
-    local $/;
-    my $ldap_json = <$lfh>;
-    close $lfh;
-
-    my $ldap_raw = eval { decode_json($ldap_json) };
-    die "Fehler beim Parsen der LDAP Config $ldap_config_file: $@" if $@;
-    die "LDAP Config $ldap_config_file ist kein JSON Objekt\n" unless ref $ldap_raw eq 'HASH';
-
-    if (exists $ldap_raw->{ldap} && ref $ldap_raw->{ldap} eq 'HASH') {
-        $ldap_conf = $ldap_raw->{ldap};
-        $log->info("LDAP Config aus ldap Block der externen Datei uebernommen");
-    } else {
-        $ldap_conf = $ldap_raw;
-        $log->info("LDAP Config aus Root Objekt der externen Datei uebernommen");
-    }
-} else {
-    $log->info("Keine separate LDAP Config Datei, nutze ldap Block aus Haupt Config");
-}
-
-# =========================
-# Globale Settings aus Config
-# =========================
-
-my $suffix_handler = Domain::PublicSuffix->new();
 
 sub _as_list {
-    my ($val) = @_;
-    return () unless defined $val;
-    if (ref $val eq 'ARRAY') {
-        return map { defined $_ ? $_ : () } @$val;
-    } else {
-        return map { s/^\s+|\s+$//gr } split /,/, $val;
+    my ($v) = @_;
+    return () unless defined $v;
+    return ref($v) eq 'ARRAY' ? @$v : ($v);
+}
+
+sub _lcset {
+    my %h;
+    for my $v (@_) {
+        next unless defined $v;
+        my $x = lc($v);
+        $x =~ s/\.$//;
+        next unless $x ne "";
+        $h{$x} = 1;
+    }
+    return \%h;
+}
+
+sub is_valid_domain {
+    my ($domain) = @_;
+    return 0 unless $domain;
+    $domain = lc $domain;
+    return 0 if $domain =~ /\s/;
+    return 0 if $domain !~ /^[a-z0-9.-]+\.[a-z]{2,}$/;
+    return 0 if $domain =~ /\.\./;
+    return 1;
+}
+
+sub load_config {
+    my ($file) = @_;
+    die "Konfigurationsdatei fehlt: $file\n" unless $file && -f $file;
+
+    open my $fh, '<:encoding(UTF-8)', $file or die "Kann Konfiguration nicht öffnen: $file: $!";
+    local $/;
+    my $raw = <$fh>;
+    close $fh;
+
+    my $data = eval { decode_json($raw) };
+    die "JSON-Fehler in $file: $@\n" if $@;
+    return $data;
+}
+
+sub atomic_write_json {
+    my ($target_file, $data) = @_;
+    my $dir = dirname($target_file);
+    make_path($dir) unless -d $dir;
+
+    my ($fh, $tmp) = tempfile(
+        "domain_dns_audit_XXXX",
+        DIR    => $dir,
+        SUFFIX => ".tmp",
+        UNLINK => 1,
+    );
+    binmode($fh, ":encoding(UTF-8)") or die "binmode fehlgeschlagen: $!";
+    print $fh encode_json($data);
+    close $fh or die "Kann temporäre Datei nicht schließen: $!";
+
+    rename $tmp, $target_file or die "Kann $tmp nach $target_file nicht umbenennen: $!";
+}
+
+sub dated_output_path {
+    my ($path, $date) = @_;
+    $date //= strftime("%Y%m%d", localtime);
+
+    return File::Spec->catfile($BASE, "json", "domain_dns_audit_$date.json") unless $path;
+
+    if ($path =~ /%Y%m%d/) {
+        $path =~ s/%Y%m%d/$date/g;
+        return $path;
+    }
+    elsif ($path =~ /\.json$/i) {
+        my ($base, $suffix) = basename($path) =~ /^(.*?)(\.json)$/i;
+        return File::Spec->catfile(dirname($path), $base . "_" . $date . $suffix);
+    }
+    else {
+        return File::Spec->catfile($path, "domain_dns_audit_$date.json");
     }
 }
 
-# LDAP optional / mehrere URIs moeglich
-my @LDAP_URIS = _as_list($ldap_conf->{uri} // $ldap_conf->{uris});
-
-my $LDAP_ENABLED;
-if (exists $ldap_conf->{enabled}) {
-    $LDAP_ENABLED = $ldap_conf->{enabled} ? 1 : 0;
-} else {
-    $LDAP_ENABLED = @LDAP_URIS ? 1 : 0;
+sub worst_status {
+    my @statuses = @_;
+    my $worst = "ok";
+    for my $s (@statuses) {
+        next unless $s;
+        $worst = "warn" if $s eq "warn" && $worst eq "ok";
+        $worst = "fail" if $s eq "fail";
+    }
+    return $worst;
 }
 
-$log->info(
-    "LDAP_ENABLED = $LDAP_ENABLED"
-    . (@LDAP_URIS ? " (URIs: " . join(", ", @LDAP_URIS) . ")" : "")
-);
+# --- DNS-Funktionen ---
+sub build_resolver {
+    my ($dns_conf) = @_;
+    $dns_conf //= {};
 
-my $GLOBAL_REQUIRE_SPF  = exists $check_conf->{require_spf}
-    ? ($check_conf->{require_spf} ? 1 : 0)
-    : 1;
+    my $res = Net::DNS::Resolver->new;
 
-my $GLOBAL_REQUIRE_DKIM = exists $check_conf->{require_dkim}
-    ? ($check_conf->{require_dkim} ? 1 : 0)
-    : 1;
+    my $use_dnssec = exists $dns_conf->{dnssec} ? $dns_conf->{dnssec} : 1;
+    $res->dnssec($use_dnssec);
 
-my @GLOBAL_DMARC_OK_POL  = _as_list($check_conf->{dmarc_ok_policies});
-@GLOBAL_DMARC_OK_POL     = ("reject", "quarantine") unless @GLOBAL_DMARC_OK_POL;
+    # EDNS0 UDP Size klein halten (hilft gegen Fragment-Drops)
+    my $udp_size = $dns_conf->{edns_udp_size} // 1232;
+    eval { $res->udppacketsize($udp_size); 1 } or do {};
+    eval { $res->edns_size($udp_size); 1 } or do {};
 
-my @GLOBAL_DKIM_SELECTORS             = _as_list($check_conf->{dkim_selectors});
-my @GLOBAL_DKIM_TXT_REQUIRED_CONTAINS = _as_list($check_conf->{dkim_txt_required_contains});
+    my $ns = $dns_conf->{nameservers} // $dns_conf->{servers};
+    if (ref($ns) eq 'ARRAY' && @$ns) {
+        $res->nameservers(@$ns);
+    }
 
-my $GLOBAL_MX_POLICY    = $check_conf->{mx_policy}    || {};
-my $GLOBAL_SPF_POLICY   = $check_conf->{spf_policy}   || {};
-my $GLOBAL_DKIM_POLICY  = $check_conf->{dkim_policy}  || {};
-my $GLOBAL_DMARC_POLICY = $check_conf->{dmarc_policy} || {};
+    $res->udp_timeout($dns_conf->{udp_timeout} // DEFAULT_DNS_TIMEOUT);
+    $res->tcp_timeout($dns_conf->{tcp_timeout} // 20);
+    $res->retrans($dns_conf->{retrans} // 2);
+    $res->retry($dns_conf->{retry} // 2);
 
-# DNS Konfiguration aus JSON (mit Defaults)
-my $DNS_TIMEOUT     = defined $dns_conf->{timeout}     ? $dns_conf->{timeout}     : 5;
-my $DNS_UDP_TIMEOUT = defined $dns_conf->{udp_timeout} ? $dns_conf->{udp_timeout} : 2;
-my $DNS_TCP_TIMEOUT = defined $dns_conf->{tcp_timeout} ? $dns_conf->{tcp_timeout} : 4;
-
-my @DNS_SERVERS = _as_list($dns_conf->{servers});
-if (@DNS_SERVERS) {
-    $log->info(
-        "DNS Server aus Config: " . join(", ", @DNS_SERVERS)
-        . " (udp_timeout=$DNS_UDP_TIMEOUT, tcp_timeout=$DNS_TCP_TIMEOUT, alarm_timeout=$DNS_TIMEOUT)"
-    );
-} else {
-    $log->info(
-        "Kein DNS Server in Config, nutze System Resolver "
-        . "(udp_timeout=$DNS_UDP_TIMEOUT, tcp_timeout=$DNS_TCP_TIMEOUT, alarm_timeout=$DNS_TIMEOUT)"
-    );
+    return $res;
 }
 
-my @EXTRA_DOMAINS   = map { lc $_ } _as_list($dom_conf->{extra_domains});
-my @EXCLUDE_DOMAINS = map { lc $_ } _as_list($dom_conf->{exclude_domains});
-
-my $PROFILE_CONF = $check_conf->{profiles} || {};
-
-# Runtime / Parallelitaet
-my $CONFIG_MAX_PROCS = $runtime_conf->{max_procs};
-$CONFIG_MAX_PROCS = 20 unless defined $CONFIG_MAX_PROCS && $CONFIG_MAX_PROCS =~ /^\d+$/ && $CONFIG_MAX_PROCS > 0;
-
-my $MAX_PROCS = defined $opt_max_procs && $opt_max_procs > 0 ? $opt_max_procs : $CONFIG_MAX_PROCS;
-$log->info("Maximale parallele Prozesse: $MAX_PROCS (Config=" . $CONFIG_MAX_PROCS . ", CLI=" . ($opt_max_procs // 'undef') . ")");
-
-# =========================
-# DNS Resolver Konfiguration
-# =========================
-
-my %resolver_opts = (
-    retry       => 2,
-    udp_timeout => $DNS_UDP_TIMEOUT,
-    tcp_timeout => $DNS_TCP_TIMEOUT,
-);
-
-if (@DNS_SERVERS) {
-    $resolver_opts{nameservers} = \@DNS_SERVERS;
+sub _dns_cache_key {
+    my ($name, $type) = @_;
+    $name = lc($name // "");
+    $name =~ s/\.$//;
+    $type = uc($type // "");
+    return "$type|$name";
 }
-
-# =========================
-# DNS Wrapper mit Timeout und Retries
-# =========================
 
 sub safe_dns_query {
-    my ($resolver, $name, $type, $max_retries) = @_;
-    $type        ||= 'A';
-    $max_retries ||= 2;
+    my ($resolver, $name, $type, $max_retries, $timeout) = @_;
+    $type       //= 'A';
+    $max_retries //= MAX_DNS_RETRIES;
+    $timeout    //= DEFAULT_DNS_TIMEOUT;
 
+    my $key = _dns_cache_key($name, $type);
+    return $DNS_CACHE{$key} if exists $DNS_CACHE{$key};
+
+    my $retry_delay = 1;
     for my $attempt (1 .. $max_retries) {
-        my $pkt;
+        my ($pkt, $timed_out);
 
+        # Wir nutzen einen harten Watchdog-Timer
+        local $SIG{ALRM} = sub { $timed_out = 1; die "TIMEOUT\n" };
         eval {
-            timeout $DNS_TIMEOUT => sub {
-                $pkt = $resolver->query($name, $type);
-            };
+            alarm $timeout;
+            $pkt = $resolver->query($name, $type);
+            alarm 0;
         };
+        alarm 0; # Sicherstellen, dass der Alarm aus ist
 
         if ($@) {
-            if ($@ =~ /timeout/i) {
-                $log->warn("[DNS] Timeout bei Query: $name ($type) Versuch $attempt");
+            my $err = $@;
+            if ($err =~ /TIMEOUT/ || $timed_out) {
+                $log->warn("[DNS] Timeout bei $name ($type), Versuch $attempt/$max_retries");
             } else {
-                $log->warn("[DNS] Fehler bei Query: $name ($type) Versuch $attempt: $@");
+                $log->debug("[DNS] Fehler bei $name ($type): $err");
             }
+            sleep $retry_delay if $attempt < $max_retries;
+            $retry_delay *= 1.5;
             next;
         }
 
-        return $pkt if $pkt;
+        if ($pkt) {
+            $DNS_CACHE{$key} = $pkt;
+            return $pkt;
+        }
+
+        sleep $retry_delay if $attempt < $max_retries;
     }
 
-    $log->error("[DNS] Alle Versuche fuer $name ($type) fehlgeschlagen");
-    return undef;
+    $DNS_CACHE{$key} = undef;
+    return;
 }
-
-# =========================
-# Hilfsfunktionen
-# =========================
-
-sub fetch_domains_from_ldap {
-    my @uris = @LDAP_URIS;
-    die "ldap.uri oder ldap.uris fehlt in LDAP Config\n" unless @uris;
-
-    my $bind_dn = $ldap_conf->{bind_dn}     || "";
-    my $bind_pw = $ldap_conf->{bind_pw}     || "";
-    my $base_dn = $ldap_conf->{base_dn}     || die "ldap.base_dn fehlt in LDAP Config\n";
-    my $filter  = $ldap_conf->{filter}      || "(objectClass=*)";
-
-    # NEU: mehrere Attribute erlauben (Liste oder Komma-getrennt)
-    my @attr_domains = _as_list(
-        defined $ldap_conf->{attr_domain}
-            ? $ldap_conf->{attr_domain}
-            : "associatedDomain"
-    );
-    @attr_domains = ("associatedDomain") unless @attr_domains;
-
-    my $last_err;
-    my $ldap;
-    my $mesg;
-
-URI_LOOP:
-    for my $uri (@uris) {
-        $log->info(
-            "Versuche LDAP Server: $uri "
-            . "(BaseDN=$base_dn, Filter=$filter, Attrs=" . join(",", @attr_domains) . ")"
-        );
-
-        $ldap = Net::LDAP->new($uri, timeout => 10);
-        if (!$ldap) {
-            $last_err = "LDAP Verbindung fehlgeschlagen zu $uri: $@ oder $!";
-            $log->warn($last_err);
-            next URI_LOOP;
-        }
-
-        if ($bind_dn) {
-            $mesg = $ldap->bind($bind_dn, password => $bind_pw);
-        } else {
-            $mesg = $ldap->bind;
-        }
-
-        if ($mesg->code) {
-            $last_err = "LDAP Bind Fehler auf $uri: " . ldap_error_text($mesg->code);
-            $log->warn($last_err);
-            $ldap->unbind;
-            $ldap = undef;
-            next URI_LOOP;
-        }
-
-        $log->info("LDAP Bind erfolgreich auf $uri");
-        last URI_LOOP;
-    }
-
-    die "Keiner der LDAP Server erreichbar oder bindbar: $last_err\n"
-        unless $ldap;
-
-    # NEU: alle konfigurierten Attribute holen
-    $mesg = $ldap->search(
-        base   => $base_dn,
-        scope  => 'sub',
-        filter => $filter,
-        attrs  => \@attr_domains,
-    );
-
-    if ($mesg->code) {
-        my $err = "LDAP Suche Fehler: " . ldap_error_text($mesg->code);
-        $ldap->unbind;
-        die "$err\n";
-    }
-
-    my %domains;
-
-    foreach my $entry ($mesg->entries) {
-
-        # alle konfigurierten Attribute durchgehen
-        for my $attr (@attr_domains) {
-            my @vals = $entry->get_value($attr);
-            for my $d (@vals) {
-                next unless defined $d;
-                $d =~ s/^\s+|\s+$//g;
-                next unless $d;
-                $d = lc $d;
-                $domains{$d} = 1;
-            }
-        }
-    }
-
-    $ldap->unbind;
-
-    my @dom_list = sort keys %domains;
-    $log->info("LDAP Domains gefunden: " . scalar(@dom_list));
-    return @dom_list;
-}
-
 
 sub get_txt_records {
-    my ($resolver, $name) = @_;
-    my $pkt = safe_dns_query($resolver, $name, "TXT");
+    my ($resolver, $name, $timeout) = @_;
+    my $pkt = safe_dns_query($resolver, $name, 'TXT', MAX_DNS_RETRIES, $timeout);
     return () unless $pkt;
+
     my @txt;
-
-    foreach my $rr ($pkt->answer) {
+    for my $rr ($pkt->answer) {
         next unless $rr->type eq "TXT";
-
-        # txtdata liefert in Listkontext alle Teilstrings
-        my @parts = $rr->txtdata;
-
-        # Fuer DKIM/SPF/DMARC wollen wir den logischen Gesamtstring
-        my $full = join('', @parts);
-
-        push @txt, $full;
+        my $t = $rr->txtdata;
+        push @txt, join("", $t) if defined $t;
     }
-
     return @txt;
 }
 
-sub get_txt_records_with_cname {
-    my ($resolver, $name) = @_;
+sub resolve_cname_target {
+    my ($resolver, $name, $max_hops, $timeout) = @_;
+    $max_hops //= MAX_CNAME_HOPS;
 
-    # 1. TXT holen (kann über CNAME aufgeloest werden)
-    my @txt = get_txt_records($resolver, $name);
+    my %seen;
+    my $cur = lc($name // "");
+    $cur =~ s/\.$//;
 
-    # 2. CNAME immer explizit prüfen
-    my $pkt = safe_dns_query($resolver, $name, "CNAME");
-    my $cname_used   = 0;
-    my $cname_target = undef;
+    for (my $i = 0; $i < $max_hops; $i++) {
+        return "" if $seen{$cur}++;
 
-    if ($pkt) {
+        my $pkt = safe_dns_query($resolver, $cur, 'CNAME', MAX_DNS_RETRIES, $timeout);
+        return "" unless $pkt;
+
         my ($cname_rr) = grep { $_->type eq 'CNAME' } $pkt->answer;
-        if ($cname_rr) {
-            $cname_used   = 1;
-            $cname_target = $cname_rr->cname;
+        return "" unless $cname_rr;
 
-            # Falls am Alias selbst keine TXT waren, TXT am Target nachladen
-            if (!@txt) {
-                @txt = get_txt_records($resolver, $cname_target);
-            }
-        }
+        my $target = lc($cname_rr->cname // "");
+        $target =~ s/\.$//;
+        return "" if !$target || $target eq $cur;
+        $cur = $target;
     }
 
-    return {
-        txt          => \@txt,
-        cname_used   => $cname_used,
-        cname_target => $cname_target,
-    };
+    return "";
 }
 
-sub spf_mode_rank {
-    my ($mode) = @_;
-    return 4 if $mode eq 'hard';
-    return 3 if $mode eq 'soft';
-    return 2 if $mode eq 'neutral';
-    return 2 if $mode eq 'no-all';
-    return 1 if $mode eq 'open';
-    return 0 if $mode eq 'none';
-    return 0;
+sub get_txt_records_follow_cname {
+    my ($resolver, $name, $timeout) = @_;
+    my @txt = get_txt_records($resolver, $name, $timeout);
+    return (\@txt, "") if @txt;
+
+    my $target = resolve_cname_target($resolver, $name, MAX_CNAME_HOPS, $timeout);
+    return ([], "") unless $target;
+
+    my @txt2 = get_txt_records($resolver, $target, $timeout);
+    return (\@txt2, $target);
 }
 
-sub org_domain {
-    my ($dom) = @_;
-    return undef unless defined $dom;
+sub get_mx_records {
+    my ($resolver, $domain, $timeout) = @_;
+    my $pkt = safe_dns_query($resolver, $domain, 'MX', MAX_DNS_RETRIES, $timeout);
+    return () unless $pkt;
 
-    my $root = $suffix_handler->get_root_domain($dom);
+    my @mx = map {
+        { preference => $_->preference, exchange => lc($_->exchange) }
+    } grep { $_->type eq "MX" } $pkt->answer;
 
-    if (defined $root) {
-        return $root;
-    }
-
-    my @p = split /\./, $dom;
-    return join('.', @p[-2, -1]) if @p >= 2;
-    return $dom;
+    @mx = sort { $a->{preference} <=> $b->{preference} } @mx;
+    return @mx;
 }
 
-# =========================
-# Hostname Validierung (MX / DKIM / SPF)
-# =========================
+# --- Public Suffix / Organizational Domain Logik ---
 
-sub _valid_hostname {
-    my ($host) = @_;
-    return 0 unless defined $host;
-    $host =~ s/\.$//;
-    return 0 if length($host) == 0 || length($host) > 253;
-
-    my @labels = split /\./, $host;
-    return 0 unless @labels >= 2;
-
-    for my $lab (@labels) {
-        return 0 if $lab eq '' || length($lab) > 63;
-        return 0 if $lab =~ /^-/ || $lab =~ /-$/;
-        return 0 unless $lab =~ /^[A-Za-z][A-Za-z0-9-]*$/;
-    }
-    return 1;
-}
-
-# =========================
-# SPF Domain Validierung (SPF include/redirect, erlaubt _ am Anfang)
-# =========================
-
-sub _valid_spf_domain {
-    my ($dom) = @_;
-    return 0 unless defined $dom && $dom ne '';
-    return 0 if length($dom) > 253;
-
-    my @labels = split /\./, $dom;
-    return 0 unless @labels;
-
-    for my $lab (@labels) {
-        return 0 if $lab eq '' || length($lab) > 63;
-        # SPF Domains duerfen mit _ beginnen (z. B. _spf.example.com)
-        return 0 unless $lab =~ /^[A-Za-z0-9_][A-Za-z0-9_-]*$/;
-    }
-    return 1;
-}
-
-# =========================
-# SPF Syntax Validierung (RFC 7208, mit NetAddr::IP)
-# =========================
-
-sub validate_spf_syntax {
-    my ($spf) = @_;
-    my @errors;
+sub load_public_suffix_list {
+    my ($custom_path) = @_;
     
-    push @errors, "SPF muss mit 'v=spf1' beginnen"
-        unless $spf =~ /^v=spf1(\s|$)/i;
-    
-    my @terms = split /\s+/, $spf;
-    shift @terms if @terms && $terms[0] =~ /^v=spf1$/i;
-    
-    for my $term (@terms) {
-        next if !defined $term || $term eq '';
-        
-        my $qualifier = '';
-        if ($term =~ /^([\+\-\~\?])(.+)$/) {
-            $qualifier = $1;
-            $term      = $2;
-        }
-        
-        if ($term =~ /^(all|include|a|mx|ptr|ip4|ip6|exists)(.*)$/i) {
-            my $mech = lc($1);
-            my $rest = $2 // '';
-            
-            if ($mech eq 'ip4') {
-                if ($rest =~ /^:(.+)$/) {
-                    my $cidr = $1;
-                    my $ip   = NetAddr::IP->new($cidr);
-                    unless ($ip && $ip->version == 4) {
-                        push @errors, "Ungueltige IPv4/CIDR in SPF: $cidr";
-                    }
-                }
-            }
-            elsif ($mech eq 'ip6') {
-                if ($rest =~ /^:(.+)$/) {
-                    my $cidr = $1;
-                    my $ip   = NetAddr::IP->new($cidr);
-                    unless ($ip && $ip->version == 6) {
-                        push @errors, "Ungueltige IPv6/CIDR in SPF: $cidr";
-                    }
-                }
-            }
-            # include/a/mx/ptr/exists werden nur syntaktisch akzeptiert
-        }
-        elsif ($term =~ /^(redirect|exp)=/i) {
-            # bekannte Modifier, ok
-        }
-        else {
-            # SPF Macros oder unbekannte Terms werden hier nur markiert
-            push @errors, "Unbekannter oder komplexer SPF Term: $term";
-        }
-    }
-    
-    return \@errors;
-}
-
-# =========================
-# DKIM Tag Parsing / Key Validierung
-# =========================
-
-sub parse_dkim_tag_string {
-    my ($s) = @_;
-    my %tags;
-
-    return \%tags unless defined $s;
-    $s =~ s/^\s+|\s+$//g;
-    return \%tags unless length $s;
-
-    for my $chunk (split /;/, $s) {
-        $chunk =~ s/^\s+|\s+$//g;
-        next unless $chunk;
-
-        my ($k, $v) = split /=/, $chunk, 2;
-        next unless defined $k && defined $v;
-
-        $k =~ s/^\s+|\s+$//g;
-        $v =~ s/^\s+|\s+$//g;
-
-        $k = lc $k;
-        $v =~ s/\s+//g;
-
-        $tags{$k} = $v;
-    }
-
-    return \%tags;
-}
-
-sub dkim_txt_matches_expected {
-    my ($effective, $expected) = @_;
-
-    return 0 unless defined $effective && defined $expected;
-
-    my $eff_tags = parse_dkim_tag_string($effective);
-    my $exp_tags = parse_dkim_tag_string($expected);
-
-    for my $k (keys %{$exp_tags}) {
-        return 0 unless exists $eff_tags->{$k};
-        return 0 unless $eff_tags->{$k} eq $exp_tags->{$k};
-    }
-
-    return 1;
-}
-
-sub analyze_dkim_rfc {
-    my ($txt_combined) = @_;
-
-    my $tags = parse_dkim_tag_string($txt_combined);
-    my @errors;
-    my @warnings;
-    my $status = "ok";
-
-    if (!defined $tags->{v}) {
-        push @errors, "DKIM v Tag fehlt (RFC 6376 §3.6.1)";
-        $status = "fail";
-    } elsif (lc($tags->{v}) ne 'dkim1') {
-        push @errors, "DKIM v Tag ist nicht 'DKIM1': " . $tags->{v};
-        $status = "fail";
-    }
-
-    if (!defined $tags->{p} || $tags->{p} eq '') {
-        push @errors, "DKIM p Tag fehlt oder ist leer (Schluessel deaktiviert/fehlt)";
-        $status = "fail";
-    } else {
-        my $key_result = validate_dkim_key($tags->{p}, $tags->{k});
-        
-        push @errors,   @{$key_result->{errors}}   if $key_result->{errors};
-        push @warnings, @{$key_result->{warnings}} if $key_result->{warnings};
-        
-        if ($key_result->{status} eq 'fail' && $status ne 'fail') {
-            $status = 'fail';
-        } elsif ($key_result->{status} eq 'warn' && $status eq 'ok') {
-            $status = 'warn';
-        }
-    }
-
-    if (defined $tags->{k}) {
-        my $k = lc $tags->{k};
-        if ($k ne 'rsa' && $k ne 'ed25519') {
-            push @warnings, "Unbekannter DKIM k Parameter: $k (erwartet: rsa oder ed25519)";
-            if ($status eq "ok") {
-                $status = "warn";
-            }
-        }
-    }
-
-    if (defined $tags->{h}) {
-        my @algs = split /:/, lc($tags->{h});
-        my %allowed = map { $_ => 1 } qw(sha1 sha256);
-        
-        for my $alg (@algs) {
-            if (!$allowed{$alg}) {
-                push @warnings, "Unbekannter DKIM h Algorithmus: $alg (erwartet: sha1 oder sha256)";
-                if ($status eq "ok") {
-                    $status = "warn";
-                }
-            }
-        }
-        
-        if (@algs == 1 && $algs[0] eq 'sha1') {
-            push @warnings, "DKIM verwendet nur SHA-1 (unsicher, empfohlen: SHA-256)";
-            if ($status eq "ok") {
-                $status = "warn";
-            }
-        }
-    }
-
-    if (defined $tags->{s}) {
-        my @svc = split /:/, lc($tags->{s});
-        for my $s (@svc) {
-            if ($s ne 'email' && $s ne '*' && $s ne 'dns') {
-                push @warnings, "Unbekannter DKIM s Parameter: $s (erwartet: email, *, dns)";
-                if ($status eq "ok") {
-                    $status = "warn";
-                }
-            }
-        }
-    }
-
-    if (defined $tags->{t}) {
-        my $t = lc $tags->{t};
-        if ($t =~ /y/) {
-            push @warnings, "DKIM t Flag enthaelt 'y' (Testmodus, Signaturen sollten ignoriert werden)";
-            if ($status eq "ok") {
-                $status = "warn";
-            }
-        }
-        if ($t =~ /s/) {
-            push @warnings, "DKIM t Flag enthaelt 's' (Strenger Modus, Subdomains muessen signieren)";
-        }
-    }
-
-    if (defined $tags->{n} && $tags->{n} ne '') {
-        push @warnings, "DKIM n Tag vorhanden (Notiz): '" . substr($tags->{n}, 0, 50) . "'";
-    }
-
-    my @known_tags = qw(v p k h s t n);
-    my %known = map { $_ => 1 } @known_tags;
-    
-    for my $tag (keys %$tags) {
-        if (!$known{$tag}) {
-            push @warnings, "Unbekanntes DKIM Tag: $tag";
-            if ($status eq "ok") {
-                $status = "warn";
-            }
-        }
-    }
-
-    my $detail = "DKIM RFC Analyse: $status";
-    if (@errors) {
-        $detail .= " [Fehler: " . join("; ", @errors) . "]";
-    }
-    if (@warnings) {
-        $detail .= " [Warnungen: " . join("; ", @warnings) . "]";
-    }
-
-    return {
-        status   => $status,
-        errors   => \@errors,
-        warnings => \@warnings,
-        detail   => $detail,
-        tags     => $tags,
-    };
-}
-
-# =========================
-# DKIM Key Validation (RFC 6376/8463)
-# =========================
-
-sub classify_rsa_bits {
-    my ($approx_bits) = @_;
-
-    # Typische RSA-Schlüsselgrössen
-    my @known = (1024, 1536, 2048, 3072, 4096);
-
-    my $best      = undef;
-    my $best_diff = undef;
-
-    for my $k (@known) {
-        my $d = abs($approx_bits - $k);
-        if (!defined $best_diff || $d < $best_diff) {
-            $best      = $k;
-            $best_diff = $d;
-        }
-    }
-
-    return ($best, $best_diff);
-}
-
-
-sub validate_dkim_key {
-    my ($p_tag, $k_tag) = @_;
-    my @errors;
-    my @warnings;
-    my $status = "ok";
-
-    # p Tag muss da sein
-    unless (defined $p_tag && $p_tag ne '') {
-        push @errors, "DKIM p Tag ist leer oder undefiniert";
-        return { errors => \@errors, warnings => \@warnings, status => "fail" };
-    }
-
-    # 1. Base64 Grundvalidierung (RFC 4648)
-    unless ($p_tag =~ m{^[A-Za-z0-9+/]+={0,2}$}) {
-        push @errors, "DKIM p Tag: ungueltiges Base64 Format (RFC 4648)";
-        $status = "fail";
-
-        if ($p_tag =~ /[^A-Za-z0-9+\/=]/) {
-            my @invalid_chars = $p_tag =~ /([^A-Za-z0-9+\/=])/g;
-            my %unique_invalid = map { $_ => 1 } @invalid_chars;
-            push @errors, "Ungueltige Zeichen im p Tag: " . join("", sort keys %unique_invalid);
-        }
-
-        if ($p_tag =~ /=./) {
-            push @errors, "Base64 '=' Zeichen nicht nur am Ende";
-        }
-
-        return { errors => \@errors, warnings => \@warnings, status => $status };
-    }
-
-    # 2. Laengenberechnung auf Blob-Ebene (DER-Blob, NICHT reiner Modulus)
-    my $base64_len = length($p_tag);
-
-    my $padded_len = $base64_len;
-    $padded_len-- while $padded_len > 0 && substr($p_tag, $padded_len-1, 1) eq '=';
-
-    my $byte_len     = int($padded_len * 3 / 4);
-    my $bit_len_blob = $byte_len * 8;
-
-    # Grobe Schaetzung der eigentlichen Schluessellaenge
-    # Typisch sind 1024 / 2048 / 4096 Bit; der DER-Overhead macht den Blob groesser.
-    my $approx_bits;
-    if    ($bit_len_blob < 1536) { $approx_bits = 1024; }
-    elsif ($bit_len_blob < 3072) { $approx_bits = 2048; }
-    elsif ($bit_len_blob < 6144) { $approx_bits = 4096; }
-    else                         { $approx_bits = $bit_len_blob; }  # Fallback
-
-    $log->debug("[DKIM Key] Base64 length=$base64_len, blob_bits=$bit_len_blob, approx_key_bits=$approx_bits");
-
-	 my $key_type = lc($k_tag // 'rsa');
-
-	if ($key_type eq 'rsa') {
-
-		# approx_bits kommt aus deiner bisherigen Schätzung des Base64-Blobs
-		my ($nominal_bits, $diff) = classify_rsa_bits($approx_bits);
-
-		my $bits_for_policy;
-		my $bits_label;
-
-		if (defined $nominal_bits && $diff <= 200) {
-			# z. B. 1296 -> 1024, 2110 -> 2048, 4100 -> 4096
-			$bits_for_policy = $nominal_bits;
-			$bits_label      = $nominal_bits . ' Bit';
-		} else {
-			# wirklich exotische Grösse, dann bleiben wir bei der Approximation
-			$bits_for_policy = $approx_bits;
-			$bits_label      = "ca. ${approx_bits} Bit";
-		}
-
-		# Policy anhand der "nominalen" Bitlänge
-		if ($bits_for_policy < 1024) {
-			push @errors, "DKIM RSA Schlüssel zu kurz, nur ${bits_label} (< 1024 Bit)";
-			$status = "fail";
-		}
-		elsif ($bits_for_policy < 2048) {
-			push @warnings, "DKIM RSA Schlüssel hat nur ${bits_label} (empfohlen sind 2048 Bit)";
-			$status = "warn" if $status eq "ok";
-		}
-		elsif ($bits_for_policy > 4096) {
-			push @warnings, "DKIM RSA Schlüssel sehr lang (${bits_label}, > 4096 Bit, kann Performance-Probleme verursachen)";
-			$status = "warn" if $status eq "ok";
-		}
-
-	} elsif ($key_type eq 'ed25519') {
-
-		# Für Ed25519 macht die Blob-Schätzung wenig Sinn, hier eher hart prüfen
-		if ($byte_len != 32) {
-			push @errors,
-				"DKIM Ed25519 Schlüssel hat unerwartete Länge: ${byte_len} Bytes (erwartet: 32 Bytes, RFC 8463)";
-			$status = "fail";
-		}
-
-		if ($approx_bits != 256) {
-			push @warnings,
-				"DKIM Ed25519 Schlüssel wirkt nicht wie 256 Bit (approx = ${approx_bits} Bit)";
-			$status = "warn" if $status eq "ok";
-		}
-
-	} else {
-
-		push @warnings,
-			"Unbekannter DKIM Schlüsseltyp: ${key_type} (erwartet: rsa oder ed25519)";
-		$status = "warn" if $status eq "ok";
-
-		if ($approx_bits < 256) {
-			push @warnings,
-				"DKIM Schlüssel (${key_type}) wirkt sehr kurz (approx ${approx_bits} Bit)";
-			$status = "warn" if $status eq "ok";
-		}
-	}
-
-
-    # Platzhalter / offensichtlich schlechte Keys
-    if ($p_tag =~ /^(?:YQ==|MTIz|AAAA)/) {
-        push @warnings, "DKIM p Tag sieht aus wie Test oder Platzhalter Daten";
-        $status = "warn" if $status eq "ok";
-    }
-
-    # Wiederholungsmuster im Base64 (kein harter Fehler, nur Hinweis)
-    if ($base64_len > 20) {
-        my $first_half  = substr($p_tag, 0, int($base64_len / 2));
-        my $second_half = substr($p_tag, int($base64_len / 2));
-        if ($first_half eq $second_half) {
-            push @warnings, "DKIM Schluessel zeigt Wiederholungsmuster (moeglicherweise schwach generiert)";
-            $status = "warn" if $status eq "ok";
-        }
-    }
-
-    return {
-        errors      => \@errors,
-        warnings    => \@warnings,
-        status      => $status,
-        key_type    => $key_type,
-        base64_len  => $base64_len,
-        byte_len    => $byte_len,
-        blob_bits   => $bit_len_blob,   # zur Info
-        approx_bits => $approx_bits,    # geschaetzte Schluessellaenge
-    };
-}
-
-
-# =========================
-# DMARC / URI / RFC Analyse
-# =========================
-
-sub parse_dmarc_tag {
-    my ($tagstr) = @_;
-    my %tags;
-    for my $p (split /;/, $tagstr) {
-        $p =~ s/^\s+|\s+$//g;
-        next unless $p;
-        my ($k, $v) = split /=/, $p, 2;
-        next unless defined $k and defined $v;
-        $k =~ s/^\s+|\s+$//g;
-        $v =~ s/^\s+|\s+$//g;
-        $tags{lc $k} = $v;
-    }
-    return %tags;
-}
-
-sub validate_dmarc_uri {
-    my ($uri) = @_;
-    
-    return "URI ist leer" unless $uri;
-    
-    if ($uri =~ /^mailto:([^\s!]+)$/i) {
-        my $email = $1;
-        
-        if ($email =~ /^(.+?)!(\d+[km]?)$/i) {
-            my ($addr, $size) = ($1, $2);
-            return "Ungueltige Email in mailto: $addr"
-                unless $addr =~ /^[^@]+@[^@]+\.[^@]+$/;
-            if ($size =~ /^(\d+)([km]?)$/i) {
-                my ($num, $unit) = ($1, lc($2 // ''));
-                return "Size Limit zu gross" if $num > 1000000;
-            } else {
-                return "Ungueltiges Size Limit Format: $size";
-            }
-        } else {
-            return "Ungueltige Email in mailto: $email"
-                unless $email =~ /^[^@]+@[^@]+\.[^@]+$/;
-        }
-        
+    # Priorität: 1. Pfad aus Config, 2. Standardpfad im Script-Verzeichnis
+    my $psl_file = $custom_path || File::Spec->catfile($BASE, "public_suffix_list.dat");
+
+    unless (-f $psl_file) {
+        $log->warn("PSL Datei nicht gefunden unter $psl_file - nutze einfache Heuristik.");
         return undef;
     }
+
+    my %psl;
+    if (open my $fh, '<:encoding(UTF-8)', $psl_file) {
+        while (my $line = <$fh>) {
+            $line =~ s/^\s+|\s+$//g;
+            next if !$line || $line =~ m|^//| || $line =~ m|^\*|;
+            $psl{lc($line)} = 1;
+        }
+        close $fh;
+        $log->debug("PSL geladen von $psl_file (" . scalar(keys %psl) . " Einträge).");
+        return \%psl;
+    }
+    return undef;
+}
+
+sub get_organizational_domain {
+    my ($domain) = @_;
+    $domain = lc(_trim($domain));
+    return "" unless $domain;
+
+    my @parts = split(/\./, $domain);
     
-    return "Nur mailto: URIs sind in DMARC erlaubt";
-}
-
-sub analyze_dmarc_rfc {
-    my ($tags, $rua_raw, $ruf_raw) = @_;
-    my @warnings;
-    my $status = "ok";
-
-    my $pct = defined $tags->{pct} ? $tags->{pct} : 100;
-    if (!defined $tags->{pct}) {
-        push @warnings, "DMARC pct nicht gesetzt, Default 100 wird angenommen";
-    } else {
-        if ($pct !~ /^\d+$/ || $pct < 0 || $pct > 100) {
-            push @warnings, "DMARC pct ausserhalb 0 100: $pct";
-            $status = "warn" if $status eq "ok";
-        }
+    # Fallback: Wenn keine PSL da ist, nimm die letzten zwei Teile (Heuristik)
+    unless ($PSL_REF) {
+        return @parts <= 2 ? $domain : join('.', @parts[-2, -1]);
     }
 
-    if (defined $tags->{ri}) {
-        my $ri = $tags->{ri};
-        if ($ri !~ /^\d+$/ || $ri <= 0) {
-            push @warnings, "DMARC ri (Interval) ungueltig: $ri";
-            $status = "warn" if $status eq "ok";
-        } elsif ($ri < 3600) {
-            push @warnings, "DMARC ri < 3600 Sekunden (ungewoehnlich klein): $ri";
-        }
-    }
-
-    if (defined $tags->{fo}) {
-        my @vals = split /:/, $tags->{fo};
-        for my $v (@vals) {
-            next if $v eq '0' || $v eq '1' || $v eq 'd' || $v eq 's';
-            push @warnings, "Unbekannter DMARC fo Wert: $v";
-            $status = "warn" if $status eq "ok";
-        }
-    }
-
-    if (defined $tags->{rf}) {
-        my @vals = split /:/, $tags->{rf};
-        for my $v (@vals) {
-            next if lc($v) eq 'afrf';
-            push @warnings, "Unbekanntes DMARC rf Format: $v";
-            $status = "warn" if $status eq "ok";
-        }
-    }
-
-    for my $u (@$rua_raw, @$ruf_raw) {
-        next unless defined $u && $u ne '';
-        my $err = validate_dmarc_uri($u);
-        if ($err) {
-            push @warnings, "DMARC URI '$u' ungueltig: $err";
-            $status = "warn" if $status eq "ok";
-        }
-    }
-
-    return {
-        status   => $status,
-        warnings => \@warnings,
-        pct      => $pct,
-        ri       => $tags->{ri},
-        fo       => $tags->{fo},
-        rf       => $tags->{rf},
-    };
-}
-
-sub extract_domain_from_mailto {
-    my ($uri) = @_;
-    return undef unless $uri;
-    $uri =~ s/^\s+|\s+$//g;
-    return undef unless $uri =~ /^mailto:/i;
-    my ($addr) = $uri =~ /^mailto:([^?]+)/i;
-    return undef unless $addr && $addr =~ /\@/;
-    my (undef, $dom) = split /\@/, $addr, 2;
-    $dom = lc $dom if defined $dom;
-    return $dom;
-}
-
-sub check_external_dmarc_authorization {
-    my ($resolver, $domain, $provider_domain) = @_;
-    my $name = $domain . "._report._dmarc." . $provider_domain;
-    my @txt = get_txt_records($resolver, $name);
-
-    my $authorized = 0;
-    for my $t (@txt) {
-        if ($t =~ /v=DMARC1/i) {
-            $authorized = 1;
-            last;   # korrekt in Perl
-        }
-    }
-
-    return {
-        fqdn        => $name,
-        authorized  => $authorized ? 1 : 0,
-        txt_records => \@txt,
-    };
-}
-
-
-# =========================
-# MX Check mit RFC Analyse
-# =========================
-
-sub check_mx {
-    my ($resolver, $domain, $mx_policy) = @_;
-
-    my $pkt = safe_dns_query($resolver, $domain, "MX");
-    my @mx_hosts;
-    my @rfc_warnings;
-    my $rfc_status = "ok";
-
-    if ($pkt) {
-        foreach my $rr ($pkt->answer) {
-            next unless $rr->type eq "MX";
-            my $ex  = lc($rr->exchange);
-            my $pre = $rr->preference;
-
-            if (!_valid_hostname($ex)) {
-                push @rfc_warnings, "MX Hostname ungueltig: $ex";
-                $rfc_status = "warn" if $rfc_status eq "ok";
-            }
-
-            if ($pre !~ /^\d+$/) {
-                push @rfc_warnings, "MX Preference nicht numerisch fuer $ex: $pre";
-                $rfc_status = "warn" if $rfc_status eq "ok";
-            }
-
-            push @mx_hosts, {
-                exchange   => $ex,
-                preference => $pre,
-            };
-        }
-    }
-
-    my @actual_names = map { $_->{exchange} } @mx_hosts;
-    my $groups_conf  = $mx_policy->{groups} || [];
-    my @groups       = ref $groups_conf eq 'ARRAY' ? @$groups_conf : ();
-
-    if (!@mx_hosts) {
-        return {
-            status       => "fail",
-            detail       => "Keine MX Records gefunden",
-            mx           => \@mx_hosts,
-            groups       => \@groups,
-            rfc_analysis => {
-                status    => "fail",
-                severity  => "low",
-                warnings  => ["Keine MX Records laut DNS"],
-            },
-        };
-    }
-
-    my %pref_count;
-    for my $m (@mx_hosts) {
-        $pref_count{$m->{preference}}++;
-    }
-    my @multi_pref = grep { $pref_count{$_} > 1 } keys %pref_count;
-    if (@multi_pref) {
-        push @rfc_warnings, "Mehrere MX Eintraege mit gleicher Preference: "
-            . join(", ", @multi_pref);
-        $rfc_status = "warn" if $rfc_status eq "ok";
-    }
-
-    if (!@groups) {
-        my $detail = "MX Records gefunden: " . join(", ", @actual_names);
-        return {
-            status       => "ok",
-            detail       => $detail,
-            mx           => \@mx_hosts,
-            groups       => [],
-            rfc_analysis => {
-                status    => $rfc_status,
-                severity  => "low",
-                warnings  => \@rfc_warnings,
-            },
-        };
-    }
-
-    my $overall_status = "fail";
-    my @group_results;
-
-    for my $g (@groups) {
-        my @req = map { lc $_ } _as_list($g->{mx_required});
-        my $allow_others = exists $g->{mx_allow_others} ? ($g->{mx_allow_others} ? 1 : 0) : 1;
-
-        my %actual_set   = map { $_ => 1 } @actual_names;
-        my %required_set = map { $_ => 1 } @req;
-
-        my @missing;
-        my @unexpected;
-
-        for my $r (@req) {
-            push @missing, $r unless $actual_set{$r};
-        }
-
-        if (@req) {
-            for my $a (@actual_names) {
-                push @unexpected, $a unless $required_set{$a};
-            }
-        }
-
-        my $st = "ok";
-        my @parts;
-
-        push @parts, "MX Records: " . join(", ", @actual_names);
-
-        if (@missing) {
-            $st = "fail";
-            push @parts, "fehlende MX: " . join(", ", @missing);
-        }
-
-        if (@unexpected) {
-            if ($allow_others) {
-                push @parts, "zusaetzliche MX erlaubt: " . join(", ", @unexpected);
+    # Wir suchen den längsten passenden Suffix in der Liste
+    # Beispiel: "sub.mail.example.co.uk"
+    # Prüfe: "sub.mail.example.co.uk", "mail.example.co.uk", "example.co.uk", "co.uk", "uk"
+    for (my $i = 0; $i < @parts; $i++) {
+        my $current_suffix = join('.', @parts[$i .. $#parts]);
+        if (exists $PSL_REF->{$current_suffix}) {
+            # Wenn der Suffix gefunden wurde (z.B. "co.uk"), 
+            # ist die Org-Domain dieser Suffix + ein Label davor.
+            if ($i > 0) {
+                return join('.', @parts[$i-1 .. $#parts]);
             } else {
-                $st = "fail";
-                push @parts, "unerwartete MX: " . join(", ", @unexpected);
+                # Der Treffer ist selbst der Suffix (sollte bei validen Domains nicht passieren)
+                return $domain;
             }
         }
+    }
 
-        push @group_results, {
-            name             => $g->{name} // '',
-            status           => $st,
-            mx_required      => \@req,
-            missing_required => \@missing,
-            unexpected       => \@unexpected,
-            mx_allow_others  => $allow_others + 0,
-            detail           => join("; ", @parts),
-        };
+    # Wenn gar nichts in der PSL gefunden wurde (neue TLD?), nimm letzte zwei Teile
+    return join('.', @parts[-2, -1]) if @parts >= 2;
+    return $domain;
+}
 
-        if ($st eq 'ok' && $overall_status ne 'ok') {
-            $overall_status = 'ok';
+sub is_same_organizational_domain {
+    my ($dom1, $dom2) = @_;
+    return 1 if lc(_trim($dom1 // "")) eq lc(_trim($dom2 // ""));
+
+    my $base1 = get_organizational_domain($dom1);
+    my $base2 = get_organizational_domain($dom2);
+
+    return ($base1 ne "" && $base1 eq $base2) ? 1 : 0;
+}
+
+
+
+# --- DKIM/ARC-Funktionen ---
+sub parse_dkim_txt_kv {
+    my ($rec) = @_;
+    $rec = _trim($rec // "");
+    return {} unless $rec;
+
+    my %kv;
+    for my $part (split /\s*;\s*/, $rec) {
+        $part = _trim($part);
+        next unless $part;
+
+        my ($k, $v) = split(/\s*=\s*/, $part, 2);
+        $k = lc(_trim($k // ""));
+        next unless $k;
+
+        $v = _trim($v // "");
+        if (defined $v) {
+            if ($k eq 'p') {
+                $v =~ s/\s+//g;
+            }
+            elsif ($k eq 'v' || $k eq 'k') {
+                $v = lc($v);
+            }
+            $kv{$k} = $v;
         }
     }
 
-    my $detail = $overall_status eq 'ok'
-        ? "MX Konfiguration entspricht mindestens einem Profil"
-        : "Keine MX Profilgruppe wurde vollstaendig erfuellt";
+    # Standardwerte für fehlende Schlüssel setzen
+    $kv{v} //= "";
+    $kv{k} //= "rsa";
+    $kv{p} //= "";
 
-    return {
-        status       => $overall_status,
-        detail       => $detail,
-        mx           => \@mx_hosts,
-        groups       => \@group_results,
-        rfc_analysis => {
-            status    => $rfc_status,
-            severity  => "low",
-            warnings  => \@rfc_warnings,
-        },
-    };
+    return \%kv;
 }
 
-# =========================
-# SPF Deep Analysis (RFC 7208)
-# =========================
+sub dkim_expected_match {
+    my ($actual_rec, $expected_rec) = @_;
+    $actual_rec   //= "";
+    $expected_rec //= "";
+    return 1 if _trim($expected_rec) eq "";
 
-sub analyze_spf_recursion {
-    my ($resolver, $domain, $stats, $seen) = @_;
-    
-    if ($seen->{$domain}) {
-        push @{$stats->{warnings}}, "SPF Loop entdeckt bei Domain: $domain (Zyklus: " . join(" -> ", @{$stats->{path}}, $domain) . ")";
-        $stats->{has_loop} = 1;
-        return;
+    my $a = parse_dkim_txt_kv($actual_rec);
+    my $e = parse_dkim_txt_kv($expected_rec);
+
+    for my $k (keys %$e) {
+        return 0 unless exists $a->{$k};
+        return 0 unless defined $a->{$k} && defined $e->{$k};
+        return 0 unless $a->{$k} eq $e->{$k};
     }
-    
-    $seen->{$domain} = 1;
-    push @{$stats->{path}}, $domain;
+    return 1;
+}
 
-    if (scalar(@{$stats->{path}}) > 10) {
-        push @{$stats->{warnings}}, "SPF Rekursion zu tief (>10 Ebenen) bei $domain";
-        $stats->{too_deep} = 1;
-        return;
+my $_openssl_path_cache;
+sub _openssl_present {
+    return $_openssl_path_cache if defined $_openssl_path_cache;
+    my $p = `command -v openssl 2>/dev/null`;
+    chomp($p);
+    $_openssl_path_cache = $p ? 1 : 0;
+    return $_openssl_path_cache;
+}
+
+sub dkim_key_bits_rsa {
+    my ($rec) = @_;
+    my $kv = parse_dkim_txt_kv($rec);
+
+    return (0, "invalid: p-tag fehlt") unless exists $kv->{p};
+    if (defined $kv->{p} && $kv->{p} eq "") {
+        return (0, "revoked");
     }
 
-    my @txt = get_txt_records($resolver, $domain);
-    my @spf_records = grep { /^v=spf1(\s|$)/i } @txt;
+    my $p = $kv->{p};
+    $p =~ s/\s+//g; 
 
-    if (!@spf_records) {
-        $stats->{void_lookups}++;
-        return;
-    }
-    
-    if (@spf_records > 1) {
-        push @{$stats->{warnings}}, "Mehrere SPF Records gefunden bei $domain";
-        $stats->{multiple_spf} = 1;
-        return;
-    }
+    return (0, "openssl nicht vorhanden") unless _openssl_present();
 
-    my $spf_string = $spf_records[0];
-    my @terms = split /\s+/, $spf_string;
-    
-    if ($log->is_debug()) {
-        $log->debug("[SPF Analysis] Domain: $domain, SPF: " . substr($spf_string, 0, 100) . "...");
-    }
-    
-    foreach my $term (@terms) {
-        next if $term =~ /^v=spf1$/i;
-        next unless $term;
+    my $pem = "-----BEGIN PUBLIC KEY-----\n" .
+              join("\n", ($p =~ /.{1,64}/g)) .
+              "\n-----END PUBLIC KEY-----\n";
 
-        my $clean_term = $term;
-        $clean_term =~ s/^[\+\-\~\?]//;
+    my $output = "";
+    my ($child_out, $child_in);
+    my $pid;
+
+    # Try-Block für die Ausführung
+    try {
+        # Lokaler Alarm-Handler für diesen Block (max 3 Sekunden für OpenSSL)
+        local $SIG{ALRM} = sub { die "OPENSSL_TIMEOUT\n" };
+        alarm 3;
+
+        # Prozess starten (STDERR wird nach STDOUT umgeleitet via 2>&1)
+        $pid = open2($child_out, $child_in, 'openssl pkey -pubin -text -noout 2>&1');
         
-        if ($clean_term =~ /^include:(.*)/i) {
-            $stats->{lookups}++;
-            my $target = $1;
-            
-            if (_valid_spf_domain($target)) {
-                analyze_spf_recursion($resolver, $target, $stats, { %$seen });
-            } else {
-                push @{$stats->{warnings}}, "Ungueltiges include Target in SPF: $target";
-            }
+        # Daten schreiben
+        print $child_in $pem;
+        close($child_in); # Wichtig: Signalisiert OpenSSL das Ende der Eingabe
+        
+        # Ergebnis lesen
+        $output = do { local $/; <$child_out> };
+        
+        # Prozess ordnungsgemäß beenden
+        waitpid($pid, 0);
+        alarm 0; # Alarm deaktivieren
+    } 
+    catch {
+        alarm 0;
+        # Im Fehlerfall (Timeout oder Crash): Prozess aufräumen
+        if ($pid) {
+            kill('KILL', $pid);
+            waitpid($pid, 0); # Zombie-Vermeidung
         }
-        elsif ($clean_term =~ /^redirect=(.*)/i) {
-            $stats->{lookups}++;
-            $stats->{redirects}++;
-            my $target = $1;
-            
-            if (_valid_spf_domain($target)) {
-                analyze_spf_recursion($resolver, $target, $stats, $seen);
-            } else {
-                push @{$stats->{warnings}}, "Ungueltiges redirect Target in SPF: $target";
-            }
-            last;
+        $log->error("Fehler beim OpenSSL-Aufruf: $_");
+        return (0, "openssl_error: $_");
+    };
+
+    # Auswertung
+    if ($output =~ /ED25519 Public-Key/i) {
+        return (256, "ed25519");
+    }
+    elsif ($output =~ /Public-Key:\s*\((\d+)\s*bit\)/i) {
+        return (int($1), "rsa");
+    }
+    else {
+        return (0, "invalid_key_format");
+    }
+}
+
+# --- Profil-Matching ---
+sub profile_matches_domain {
+    my ($profile, $domain) = @_;
+    return 1 unless ref($profile) eq 'HASH';
+
+    my $match = $profile->{match};
+    return 1 unless ref($match) eq 'HASH';
+
+    if (my $domains = $match->{domains}) {
+        return 0 unless grep { defined && lc($_) eq lc($domain) } @$domains;
+    }
+
+    if (my $suffixes = $match->{suffixes}) {
+        for my $s (@$suffixes) {
+            next unless $s;
+            my $suf = lc($s);
+            $suf =~ s/^\*\.//;
+            return 1 if lc($domain) =~ /\Q$suf\E$/;
         }
-        elsif ($clean_term =~ /^(?:a|mx|ptr|exists)(?:[:\/]|$)/i) {
-            $stats->{lookups}++;
-            
-            if ($clean_term =~ /^(a|mx|ptr|exists):(.+)/i) {
-                my ($mech, $param) = ($1, $2);
-                if ($mech =~ /^(a|mx)$/i && $param =~ /^[a-z0-9]/i) {
-                    $log->debug("[SPF] Mechanismus $mech mit Parameter: $param");
+        return 0;
+    }
+
+    return 1;
+}
+
+# --- Checks: MX ---
+sub check_mx {
+    my ($resolver, $domain, $profile, $timeout) = @_;
+    return { status => "skip", message => "MX nicht gefordert", rfc => "RFC 5321" }
+        unless $profile->{require_mx};
+
+    my @mx = get_mx_records($resolver, $domain, $timeout);
+    if (!@mx) {
+        return {
+            status  => "fail",
+            message => "Keine MX Records gefunden",
+            rfc     => "RFC 5321",
+            mx      => [],
+        };
+    }
+
+    my @ex = map { lc($_->{exchange} // "") } @mx;
+    my $status = "ok";
+    my @notes;
+
+    if (my $groups = $profile->{mx_policy}{groups}) {
+        my $ex_set = _lcset(@ex);
+        for my $g (@$groups) {
+            next unless ref($g) eq 'HASH';
+            my @required = _as_list($g->{mx_required});
+            @required = map { lc($_) } @required;
+            my $allow_others = $g->{mx_allow_others} // 0;
+
+            my @missing = grep { !$ex_set->{$_} } @required;
+            if (@missing) {
+                $status = "fail";
+                push @notes, "MX fehlen: " . join(", ", @missing);
+                next;
+            }
+
+            if (!$allow_others) {
+                my $req_set = _lcset(@required);
+                my @extra = grep { !$req_set->{$_} } @ex;
+                if (@extra) {
+                    $status = "fail";
+                    push @notes, "Unerwartete MX: " . join(", ", @extra);
                 }
             }
         }
     }
+
+    return {
+        status  => $status,
+        message => $status eq 'ok' ? "MX vorhanden" : "MX Policy verletzt",
+        rfc     => "RFC 5321",
+        mx      => \@ex,
+        notes   => \@notes,
+    };
+}
+
+# --- Checks: SPF ---
+sub count_spf_lookups_recursive {
+    my ($resolver, $domain, $seen, $depth) = @_;
+    $seen  //= {};
+    $depth //= 0;
+    return 0 if $depth > MAX_SPF_LOOKUPS || $seen->{lc($domain)}++;
+
+    my @txt = get_txt_records($resolver, $domain, DEFAULT_DNS_TIMEOUT);
+    my ($spf) = grep { /^v=spf1(\s|$)/i } @txt;
+    return 0 unless $spf;
+
+    my $count = 0;
+    for my $t (split /\s+/, lc($spf)) {
+		# Erlaube optionale Qualifier am Anfang (+, -, ~, ?)
+		if ($t =~ /^[-+~?]?include:(.*)/i || $t =~ /^redirect=(.*)/i) {
+			my $target = $1 // $2;
+			$count++;
+			$count += count_spf_lookups_recursive($resolver, $target, $seen, $depth + 1);
+		}
+		elsif ($t =~ /^[-+~?]?(a|mx|ptr|exists)/i) {
+			$count++;
+		}
+    }
+    return $count;
 }
 
 sub check_spf {
-    my ($resolver, $domain, $profile, $global_spf_policy) = @_;
+    my ($resolver, $domain, $profile, $timeout) = @_;
+    return { status => "skip", message => "SPF nicht gefordert", rfc => "RFC 7208" }
+        unless $profile->{require_spf};
 
-    my $spf_policy  = $profile->{spf_policy} || $global_spf_policy || {};
-    my $require_spf = exists $profile->{require_spf}
-        ? ($profile->{require_spf} ? 1 : 0)
-        : $GLOBAL_REQUIRE_SPF;
+    my @txt = get_txt_records($resolver, $domain, $timeout);
+    my ($spf) = grep { /^v=spf1(\s|$)/i } @txt;
 
-    my @txt = get_txt_records($resolver, $domain);
-    my @spf_all = grep { /^v=spf1(\s|$)/i } @txt;
-
-    my $spf_orig = @spf_all ? $spf_all[0] : "";
-    my $mode;
-    my $has_all = 0;
-    
-    if (!@spf_all) {
-        $mode = "none";
-    } elsif ($spf_orig =~ /-all\b/i) {
-        $mode = "hard"; $has_all = 1;
-    } elsif ($spf_orig =~ /~all\b/i) {
-        $mode = "soft"; $has_all = 1;
-    } elsif ($spf_orig =~ /\?all\b/i) {
-        $mode = "neutral"; $has_all = 1;
-    } elsif ($spf_orig =~ /\ball\b/i) {
-        $mode = "open"; $has_all = 1;
-    } elsif ($spf_orig =~ /redirect=/i) {
-        $mode = "redirect";
-    } else {
-        $mode = "no-all";
-    }
-
-    my @rfc_errors;
-    my @rfc_warnings;
-    my $rfc_status = "ok";
-    
-    for my $spf_record (@spf_all) {
-        if (length($spf_record) > 255) {
-            push @rfc_errors, "SPF TXT Record >255 Bytes (RFC 7208 §12.1 Limit)";
-            $rfc_status = "fail";
-        }
-    }
-
-    my $analysis_stats = {
-        lookups      => 0,
-        void_lookups => 0,
-        redirects    => 0,
-        warnings     => [],
-        path         => [],
-        multiple_spf => 0,
-    };
-    
-    if (@spf_all) {
-        analyze_spf_recursion($resolver, $domain, $analysis_stats, {});
-    }
-
-    if (@spf_all > 1) {
-        push @rfc_errors, "Mehrere SPF Records gefunden (RFC 7208 §3.2 PermError)";
-        $rfc_status = "fail";
-        $analysis_stats->{multiple_spf} = 1;
-    }
-
-    if ($analysis_stats->{lookups} > 10) {
-        push @rfc_errors, "SPF DNS Lookups >10 ($analysis_stats->{lookups}) (RFC 7208 §4.6.4 PermError)";
-        $rfc_status = "fail";
-    }
-
-    if ($analysis_stats->{void_lookups} > 2) {
-        push @rfc_errors, "SPF Void Lookups >2 ($analysis_stats->{void_lookups}) (RFC 7208 §4.6.4 PermError)";
-        $rfc_status = "fail";
-    }
-
-    if ($analysis_stats->{redirects} > 1) {
-        push @rfc_warnings, "Mehr als ein redirect= in SPF Struktur gefunden";
-        if ($rfc_status eq "ok") {
-            $rfc_status = "warn";
-        }
-    }
-
-    if (!$has_all && $mode ne 'redirect' && @spf_all) {
-        push @rfc_warnings, "SPF ohne 'all' Mechanismus (kann zu unerwartetem Verhalten fuehren)";
-        if ($rfc_status eq "ok") {
-            $rfc_status = "warn";
-        }
-    }
-
-    my $syntax_errors = [];
-    if ($spf_orig) {
-        $syntax_errors = validate_spf_syntax($spf_orig);
-        if (@$syntax_errors) {
-            push @rfc_warnings, "SPF Syntax Warnungen: " . join("; ", @$syntax_errors);
-            if ($rfc_status eq "ok" && @$syntax_errors) {
-                $rfc_status = "warn";
-            }
-        }
-    }
-
-    if (@{$analysis_stats->{warnings}}) {
-        push @rfc_warnings, "SPF Struktur: " . join("; ", @{$analysis_stats->{warnings}});
-        if ($rfc_status eq "ok") {
-            $rfc_status = "warn";
-        }
-    }
-
-    if ($spf_orig && $spf_orig =~ /%\{/) {
-        my @macros = $spf_orig =~ /%\{([^}]+)\}/g;
-        my %seen_macros;
-        for my $macro (@macros) {
-            $seen_macros{$macro}++;
-        }
-        
-        if (keys %seen_macros) {
-            push @rfc_warnings, "SPF enthaelt Makros: " . join(", ", sort keys %seen_macros);
-            if ($rfc_status eq "ok") {
-                $rfc_status = "warn";
-            }
-        }
-    }
-
-    my $groups_conf   = $spf_policy->{groups}   || {};
-    my $defaults_conf = $spf_policy->{defaults} || {};
-    my @groups        = ref $groups_conf eq 'ARRAY' ? @$groups_conf : ();
-    
-    my $policy_status;
-    my $detail;
-    my @group_results;
-
-    if (!@spf_all && !@groups) {
-        if ($require_spf) {
-            $policy_status = "fail";
-            $detail = "Kein SPF Record vorhanden (require_spf=1)";
-        } else {
-            $policy_status = "warn";
-            $detail = "Kein SPF Record vorhanden (require_spf=0)";
-        }
-    } elsif (@groups) {
-        my $overall_status = "fail";
-        
-        for my $g (@groups) {
-            my @allowed_modes = _as_list(
-                exists $g->{allowed_modes}
-                    ? $g->{allowed_modes}
-                    : $defaults_conf->{allowed_modes}
-            );
-            my %allowed    = map { $_ => 1 } @allowed_modes;
-            my @req_parts  = _as_list($g->{required_contains});
-
-            my $gst    = "ok";
-            my @g_notes;
-
-            # Modus passend?
-            if (@allowed_modes && !$allowed{$mode} && $mode ne 'redirect') {
-                $gst = "fail";
-                push @g_notes, "Modus $mode nicht erlaubt";
-            }
-
-            # Pflichtteile im SPF?
-            for my $p (@req_parts) {
-                if (index($spf_orig, $p) < 0) {
-                    $gst = "fail";
-                    push @g_notes, "Fehlt: $p";
-                }
-            }
-
-            push @group_results, {
-                name   => $g->{name},
-                status => $gst,
-                detail => join("; ", @g_notes),
-            };
-
-            # OR Logik: wenn mindestens eine Gruppe ok ist, ist overall ok
-            if ($gst eq 'ok' && $overall_status ne 'ok') {
-                $overall_status = 'ok';
-            }
-        }
-
-        # Wenn mindestens eine Gruppe ok ist, dann sollen die
-        # restlichen "fail"-Gruppen nur als "skip" erscheinen,
-        # damit im GUI nicht alles rot wirkt.
-        if ($overall_status eq 'ok') {
-            for my $gr (@group_results) {
-                next unless defined $gr->{status};
-                next unless $gr->{status} eq 'fail';
-
-                $gr->{status} = 'skip';  # wird im PHP als grau / neutral angezeigt
-                if ($gr->{detail}) {
-                    $gr->{detail} = "Profilbedingungen fuer diese Domain nicht erfuellt: "
-                        . $gr->{detail};
-                } else {
-                    $gr->{detail} = "Profilbedingungen fuer diese Domain nicht erfuellt";
-                }
-            }
-        }
-
-        $policy_status = $overall_status;
-        $detail        = "SPF Profil Check (Modus $mode)";
-    } else {
-        $policy_status = "ok";
-        $detail = "SPF vorhanden (Modus $mode)";
-        if ($mode eq 'open' && $defaults_conf->{forbid_open}) {
-            $policy_status = "fail";
-            $detail = "SPF Modus open verboten";
-        }
-    }
-
-    my $final_status;
-    my @final_notes;
-    
-    if ($rfc_status eq "fail") {
-        $final_status = "fail";
-        push @final_notes, "RFC Verletzung";
-        $detail = "SPF ungueltig (RFC 7208): " . join("; ", @rfc_errors);
-    } else {
-        $final_status = $policy_status;
-        
-        if (@rfc_warnings) {
-            push @final_notes, "RFC Hinweise: " . join("; ", @rfc_warnings);
-        }
-        
-        if ($policy_status eq "fail") {
-            push @final_notes, "Policy Verletzung";
-        }
-    }
-
-    if (@final_notes) {
-        $detail .= " [" . join("; ", @final_notes) . "]";
-    }
-
-    my $has_void_lookup_limit = ($analysis_stats->{void_lookups} > 2) ? 1 : 0;
-    my $has_lookup_limit      = ($analysis_stats->{lookups} > 10)     ? 1 : 0;
-    my $has_multiple_spf      = $analysis_stats->{multiple_spf};
-
-    return {
-        status       => $final_status,
-        detail       => $detail,
-        require_spf  => $require_spf + 0,
-        raw_original => \@spf_all,
-        mode         => $mode,
-        rfc_analysis => {
-            status                => $rfc_status,
-            errors                => \@rfc_errors,
-            warnings              => \@rfc_warnings,
-            lookups               => $analysis_stats->{lookups},
-            void_lookups          => $analysis_stats->{void_lookups},
-            redirects             => $analysis_stats->{redirects},
-            has_void_lookup_limit => $has_void_lookup_limit,
-            has_lookup_limit      => $has_lookup_limit,
-            has_multiple_spf      => $has_multiple_spf,
-            syntax_errors         => $syntax_errors,
-            path                  => $analysis_stats->{path},
-        },
-        groups       => \@group_results,
-    };
-}
-
-# =========================
-# DMARC Check (mit RFC Analyse)
-# =========================
-
-sub check_dmarc {
-    my ($resolver, $domain, $profile, $global_dmarc_policy) = @_;
-
-    my $dmarc_policy = $profile->{dmarc_policy} || $global_dmarc_policy || {};
-
-    my @ok_policies = _as_list($dmarc_policy->{ok_policies});
-    @ok_policies = _as_list($profile->{dmarc_ok_policies}) unless @ok_policies;
-    @ok_policies = @GLOBAL_DMARC_OK_POL                     unless @ok_policies;
-
-    my $lookup_domain   = $domain;
-    my $inherited_from  = undef;
-
-    my $name = "_dmarc.$lookup_domain";
-    my @txt  = get_txt_records($resolver, $name);
-    my @dmarc = grep { /^v=DMARC1/i } @txt;
-
-    my $org_dom = org_domain($domain);
-
-    if (!@dmarc && defined $org_dom && $org_dom ne $domain) {
-        my $parent_name  = "_dmarc.$org_dom";
-        my @txt_parent   = get_txt_records($resolver, $parent_name);
-        my @dmarc_parent = grep { /^v=DMARC1/i } @txt_parent;
-
-        if (@dmarc_parent) {
-            $lookup_domain  = $org_dom;
-            $inherited_from = $org_dom;
-            @txt            = @txt_parent;
-            @dmarc          = @dmarc_parent;
-        }
-    }
-
-    if (!@dmarc) {
+    unless ($spf) {
         return {
-            status           => "fail",
-            detail           => "Kein DMARC Record gefunden",
-            raw              => \@txt,
-            inherited_from   => undef,
-            effective_domain => $lookup_domain,
+            status  => "fail",
+            message => "Kein SPF Record gefunden",
+            rfc     => "RFC 7208",
+            record  => "",
         };
-    }
-
-    my %tags   = parse_dmarc_tag($dmarc[0]);
-    my $policy = lc($tags{p} // "");
-
-    my $policy_ok = 0;
-    for my $pol (@ok_policies) {
-        if ($policy eq $pol) {
-            $policy_ok = 1;
-            last;   
-        }
-    }
-
-    my $rua         = $tags{rua} // "";
-    my $ruf         = $tags{ruf} // "";
-    my $require_rua = exists $dmarc_policy->{require_rua}
-        ? ($dmarc_policy->{require_rua} ? 1 : 0)
-        : 1;
-
-    my @rua_raw = $rua ? split /,/, $rua : ();
-    my @ruf_raw = $ruf ? split /,/, $ruf : ();
-    my @rua_domains;
-    for my $r (@rua_raw) {
-        my $d = extract_domain_from_mailto($r);
-        push @rua_domains, $d if $d;
-    }
-
-    my @allow_external = map { lc $_ } _as_list($dmarc_policy->{allow_external_rua_domains});
-    my %allow_external = map { $_ => 1 } @allow_external;
-
-    my $require_auth = exists $dmarc_policy->{require_external_authorization}
-        ? ($dmarc_policy->{require_external_authorization} ? 1 : 0)
-        : 0;
-
-    my @local_rua;
-    my @external_domains;
-    my %external_seen;
-
-    my $org_lookup = org_domain($lookup_domain);
-
-    for my $rd (@rua_domains) {
-        next unless $rd;
-        my $rua_org = org_domain($rd);
-
-        if (defined $rua_org && defined $org_lookup && $rua_org eq $org_lookup) {
-            push @local_rua, $rd;
-        } else {
-            push @external_domains, $rd unless $external_seen{$rd}++;
-        }
-    }
-
-    my @external_details;
-    my @external_allowed;
-    my @external_unapproved;
-
-    for my $ext (@external_domains) {
-
-        my $auth_info = check_external_dmarc_authorization($resolver, $lookup_domain, $ext);
-        my $in_allow  = $allow_external{$ext} ? 1 : 0;
-
-        push @external_details, {
-            domain              => $ext,
-            in_allowlist        => $in_allow,
-            authorized_via_dns  => $auth_info->{authorized},
-            auth_fqdn           => $auth_info->{fqdn},
-            auth_txt            => $auth_info->{txt_records},
-        };
-
-        if ($in_allow) {
-            push @external_allowed,   $ext;
-        } else {
-            push @external_unapproved, $ext;
-        }
     }
 
     my $status = "ok";
     my @notes;
+	
+	if ($spf =~ /\+all$/i || $spf =~ /\ball$/i) { # \b statt \s
+		$status = "fail";
+		push @notes, "Kritisch: SPF endet auf 'all' (deaktiviert Schutz komplett).";
+	}
+	
+    my %token_set = map { _trim($_) =~ s/^\+//r => 1 }
+                    grep { _trim($_) ne "" }
+                    split /\s+/, $spf;
 
-    if (!$policy_ok) {
-        $status = "warn";
-        push @notes, "DMARC Policy ist nicht streng (" . ($policy || "keine") . ")";
-    }
+    if (my $groups = $profile->{spf_policy}{groups}) {
+        for my $g (@$groups) {
+            next unless ref($g) eq 'HASH';
+            my @any = _as_list($g->{required_contains_any});
+            next unless @any;
 
-    if ($require_rua && !@rua_domains) {
-        $status = "warn" if $status eq "ok";
-        push @notes, "Kein RUA Reporting konfiguriert, obwohl require_rua=1";
-    }
+            my $ok = 0;
+            for my $a (@any) {
+                $a = _trim($a);
+                $a =~ s/^\+//;
+                $ok = 1 if $token_set{$a};
+            }
 
-    if ($require_auth) {
-
-        if (@external_unapproved) {
-            $status = "warn" if $status eq "ok";
-            push @notes,
-                "RUA nutzt nicht freigegebene externe Domains: "
-                . join(", ", @external_unapproved);
-        }
-
-        my @not_authorized = grep {
-            my $d = $_;
-            my ($det) = grep { $_->{domain} eq $d } @external_details;
-            $det && !$det->{authorized_via_dns}
-        } @external_domains;
-
-        if (@not_authorized) {
-            $status = "warn" if $status eq "ok";
-            push @notes,
-                "Externe RUA Domains ohne _report._dmarc Autorisierung: "
-                . join(", ", @not_authorized);
+            unless ($ok) {
+                $status = "fail";
+                push @notes, "SPF enthält keines von required_contains_any (Gruppe: " . ($g->{name} // "") . ")";
+            }
         }
     }
 
-    my $rfc = analyze_dmarc_rfc(\%tags, \@rua_raw, \@ruf_raw);
-    if ($rfc->{status} eq 'warn' && $status eq 'ok') {
-        $status = 'warn';
+    my $lookup_count = count_spf_lookups_recursive($resolver, $domain);
+    if ($lookup_count > MAX_SPF_LOOKUPS) {
+        $status = "fail";
+        push @notes, "SPF Lookup Limit überschritten: $lookup_count (maximal " . MAX_SPF_LOOKUPS . ")";
     }
-
-    my $detail = "DMARC ok";
-    $detail .= " (" . join(", ", @notes) . ")" if @notes;
-    if (@{$rfc->{warnings}}) {
-        $detail .= " [DMARC RFC Hinweise: " . join("; ", @{$rfc->{warnings}}) . "]";
+    else {
+        push @notes, "SPF DNS Lookups: $lookup_count/" . MAX_SPF_LOOKUPS;
     }
 
     return {
-        status           => $status,
-        detail           => $detail,
-        raw              => \@dmarc,
-        tags             => \%tags,
-        inherited_from   => $inherited_from,
-        effective_domain => $lookup_domain,
-        rua_analysis     => {
-            rua_raw                        => \@rua_raw,
-            rua_domains                    => \@rua_domains,
-            local_rua                      => \@local_rua,
-            external_domains               => \@external_domains,
-            external_allowed               => \@external_allowed,
-            external_unapproved            => \@external_unapproved,
-            require_rua                    => $require_rua + 0,
-            allowed_external_domains       => \@allow_external,
-            require_external_authorization => $require_auth + 0,
-            external_details               => \@external_details,
-        },
-        rfc_analysis     => $rfc,
+        status       => $status,
+        message      => $status eq "ok" ? "SPF vorhanden und valide" : "SPF Policy verletzt",
+        rfc          => "RFC 7208",
+        record       => $spf,
+        notes        => \@notes,
+        lookup_count => $lookup_count,
     };
 }
 
-# =========================
-# DKIM Check (mit RFC Analyse)
-# =========================
+# --- Checks: DMARC ---
 
-sub check_dkim {
-    my ($resolver, $domain, $profile, $global_dkim_policy) = @_;
 
-    my $dkim_policy  = $profile->{dkim_policy} || $global_dkim_policy || {};
+sub check_dmarc {
+    my ($resolver, $domain, $profile, $timeout) = @_;
+    return { status => "skip", message => "DMARC nicht gefordert", rfc => "RFC 7489" }
+        unless $profile->{require_dmarc};
 
-    my $require_dkim = exists $profile->{require_dkim}
-        ? ($profile->{require_dkim} ? 1 : 0)
-        : $GLOBAL_REQUIRE_DKIM;
+    my $name = "_dmarc.$domain";
+    my @txt = get_txt_records($resolver, $name, $timeout);
+    my ($rec) = grep { /^v=DMARC1(\s|;|$)/i } @txt;
 
-    my @dkim_selectors = _as_list($dkim_policy->{selectors});
-    @dkim_selectors = _as_list($profile->{dkim_selectors}) unless @dkim_selectors;
-    @dkim_selectors = @GLOBAL_DKIM_SELECTORS               unless @dkim_selectors;
-
-    if (!@dkim_selectors) {
+    unless ($rec) {
         return {
-            status => "warn",
-            detail => "Keine DKIM Selector in Profil oder global definiert, Pruefung uebersprungen",
+            status  => "fail",
+            message => "Kein DMARC Record gefunden",
+            rfc     => "RFC 7489",
+            record  => "",
         };
     }
 
-    my @dkim_required = _as_list($dkim_policy->{txt_required_contains});
-    @dkim_required = _as_list($profile->{dkim_txt_required_contains}) unless @dkim_required;
-    @dkim_required = @GLOBAL_DKIM_TXT_REQUIRED_CONTAINS               unless @dkim_required;
+    my $status = "ok";
+    my @notes;
+    my $p = "";
+    if ($rec =~ /\bp\s*=\s*([a-z]+)\b/i) { $p = lc($1); }
 
-    my $mode = $dkim_policy->{evaluation_mode} || 'any_ok';
-    $mode = 'any_ok' unless $mode =~ /^(any_ok|all_ok)$/;
+    # 1. Policy Prüfung (p=)
+    if (my @okp = _as_list($profile->{dmarc_ok_policies})) {
+        unless (grep { defined && lc($_) eq $p } @okp) {
+            $status = "fail";
+            push @notes, "DMARC p=$p nicht erlaubt.";
+        }
+    }
 
-    my $groups_conf = $dkim_policy->{groups} || [];
-    my @groups      = ref $groups_conf eq 'ARRAY' ? @$groups_conf : ();
+    # 2. RUA Prüfung & Organisational Domain Check (RFC 7489)
+    if (my $dmarc_policy_cfg = $profile->{dmarc_policy}) {
+        my @allowed_rua_domains = _as_list($dmarc_policy_cfg->{allow_external_rua_domains});
+        my $allowed_rua_set = _lcset(@allowed_rua_domains);
 
-    my $expected_map = $dkim_policy->{expected_txt} || {};
+        if ($rec =~ /\brua\s*=\s*([^;]+)/i) {
+            my $rua_val = $1;
+            my @uris = split(/\s*,\s*/, $rua_val);
 
-    my %sel_results;
-    my @statuses;
+            for my $uri (@uris) {
+                if ($uri =~ /mailto:.*\@([a-z0-9.-]+)/i) {
+                    my $rua_domain = lc($1);
+                    $rua_domain =~ s/\.$//;
 
-    for my $sel (@dkim_selectors) {
-        my $name = $sel . "._domainkey.$domain";
+                    # NEU: Robuste Prüfung auf organisatorische Verwandtschaft
+                    my $is_internal = is_same_organizational_domain($domain, $rua_domain);
 
-        my $res = get_txt_records_with_cname($resolver, $name);
-        my @txt          = @{ $res->{txt}          || [] };
-        my $cname_used   = $res->{cname_used}   ? 1 : 0;
-        my $cname_target = $res->{cname_target} || undef;
+                    if (!$is_internal) {
+                        # Nur wenn es wirklich EXTERN ist, prüfen wir Whitelist und DNS-Record
+                        if (!$allowed_rua_set->{$rua_domain}) {
+                            $status = "fail";
+                            push @notes, "Externe RUA Domain '$rua_domain' nicht in Whitelist erlaubt.";
+                        }
+                        else {
+                            # DNS Counter-Check (RFC 7489, 7.1) - External Reporting Authorization
+                            my $verify_name = "$domain._report._dmarc.$rua_domain";
+                            my @v_txt = get_txt_records($resolver, $verify_name, $timeout);
+                            my ($v_rec) = grep { /^v=DMARC1(\s|;|$)/i } @v_txt;
 
-        my @dkim = grep { /^v=DKIM1/i } @txt;
-
-        my $st;
-
-        if (!@dkim) {
-            $st = {
-                status       => "fail",
-                detail       => "Kein DKIM Record fuer Selector $sel (TXT oder CNAME Ziel)",
-                raw          => \@txt,
-                cname_used   => $cname_used,
-                cname_target => $cname_target,
-                groups       => [],
-            };
-        } else {
-            my $txt_combined = join(" ", @dkim);
-
-            my $sel_status = "ok";
-            my @group_results;
-
-            if (@groups) {
-                my $any_ok = 0;
-
-                for my $g (@groups) {
-                    my @req = _as_list($g->{required_contains});
-                    my @missing;
-
-                    for my $p (@req) {
-                        push @missing, $p unless index($txt_combined, $p) >= 0;
-                    }
-
-                    my $gst = @missing ? "fail" : "ok";
-                    $any_ok ||= ($gst eq 'ok');
-
-                    push @group_results, {
-                        name                   => $g->{name} // '',
-                        status                 => $gst,
-                        required_contains      => \@req,
-                        missing_required_parts => \@missing,
-                    };
-                }
-
-                if ($mode eq 'any_ok') {
-                    $sel_status = $any_ok ? "ok" : "fail";
-                } else {
-                    if (grep { $_->{status} eq 'fail' } @group_results) {
-                        $sel_status = "fail";
+                            unless ($v_rec) {
+                                $status = "fail";
+                                push @notes, "External Verification fehlt: Kein Record unter $verify_name.";
+                            }
+                            else {
+                                push @notes, "External Verification OK: $verify_name gefunden.";
+                            }
+                        }
                     } else {
-                        $sel_status = "ok";
+                        $log->debug("RUA Ziel '$rua_domain' ist organisatorisch verwandt mit '$domain' (Intern).");
                     }
                 }
-            } else {
-                my @missing_parts;
-                if (@dkim_required) {
-                    for my $part (@dkim_required) {
-                        push @missing_parts, $part unless index($txt_combined, $part) >= 0;
-                    }
-                }
-
-                if (@missing_parts) {
-                    if ($require_dkim) {
-                        $sel_status = 'fail';
-                    } else {
-                        $sel_status = 'warn';
-                    }
-                }
-
-                @group_results = ({
-                    name                   => 'required_parts',
-                    status                 => @missing_parts ? ($require_dkim ? 'fail' : 'warn') : 'ok',
-                    required_contains      => \@dkim_required,
-                    missing_required_parts => \@missing_parts,
-                });
             }
-
-            my $rfc = analyze_dkim_rfc($txt_combined);
-
-            if ($rfc->{status} eq 'fail') {
-                $sel_status = 'fail';
-            }
-
-            my @notes;
-
-            my $expected_val = $expected_map->{$sel};
-            if (defined $expected_val && $expected_val ne '') {
-                if (!dkim_txt_matches_expected($txt_combined, $expected_val)) {
-                    if ($require_dkim && $sel_status ne 'fail') {
-                        $sel_status = 'fail';
-                    } elsif (!$require_dkim && $sel_status eq 'ok') {
-                        $sel_status = 'warn';
-                    }
-                    push @notes, "DKIM TXT für Selector $sel entspricht nicht dem erwarteten Wert aus Config (Tag-Vergleich)";
-                } else {
-                    push @notes, "DKIM TXT für Selector $sel stimmt mit erwartetem Wert aus Config überein (Tag-Vergleich)";
-                }
-            }
-
-            if ($cname_used && $cname_target) {
-                push @notes, "DKIM TXT via CNAME-Ziel $cname_target";
-            }
-
-            # WICHTIG: KEINE RFC-Hinweise mehr in @notes pushen!
-            # if (@{ $rfc->{warnings} }) {
-            #     push @notes, "DKIM RFC Hinweise: " . join("; ", @{ $rfc->{warnings} });
-            # }
-
-            my $detail = @notes ? join("; ", @notes) : "DKIM Record für Selector $sel gefunden";
-
-
-            $st = {
-                status       => $sel_status,
-                detail       => $detail,
-                raw          => \@dkim,
-                cname_used   => $cname_used,
-                cname_target => $cname_target,
-                groups       => \@group_results,
-                rfc_analysis => $rfc,
-            };
-        }
-
-        $sel_results{$sel} = $st;
-        push @statuses, $st->{status};
-    }
-
-    my $overall_status;
-
-    if ($mode eq 'all_ok') {
-        if (grep { $_ eq 'fail' } @statuses) {
-            $overall_status = 'fail';
-        } elsif (grep { $_ eq 'warn' } @statuses) {
-            $overall_status = 'warn';
-        } else {
-            $overall_status = 'ok';
-        }
-    } else {
-        if (grep { $_ eq 'ok' } @statuses) {
-            $overall_status = 'ok';
-        } elsif (grep { $_ eq 'warn' } @statuses) {
-            $overall_status = 'warn';
-        } else {
-            $overall_status = 'fail';
         }
     }
-
-    if ($overall_status eq "fail" and !$require_dkim) {
-        $overall_status = "warn";
-    }
-
-    my $detail = "DKIM Pruefung abgeschlossen (require_dkim=$require_dkim, mode=$mode)";
 
     return {
-        status          => $overall_status,
-        detail          => $detail,
-        selectors       => \%sel_results,
-        require_dkim    => $require_dkim + 0,
-        required_parts  => \@dkim_required,
-        evaluation_mode => $mode,
+        status  => $status,
+        message => $status eq "ok" ? "DMARC OK" : "DMARC Verifizierung fehlgeschlagen",
+        rfc     => "RFC 7489",
+        record  => $rec,
+        policy  => $p,
+        notes   => \@notes,
     };
 }
 
-# =========================
-# Domain Verarbeitung
-# =========================
+# --- Checks: DKIM ---
+sub check_dkim {
+    my ($resolver, $domain, $profile, $timeout) = @_;
+    
+    # Initialer Skip-Check
+    return { status => "skip", message => "DKIM nicht gefordert", rfc => "RFC 6376", found => [] }
+        unless $profile->{require_dkim};
+
+    my @selectors = _as_list($profile->{dkim_selectors});
+    unless (@selectors) {
+        return {
+            status  => "fail",
+            message => "Keine dkim_selectors im Profil definiert",
+            rfc     => "RFC 6376",
+            found   => [],
+        };
+    }
+
+    my $pol = $profile->{dkim_policy} || {};
+    my $expected = $pol->{expected_txt} || {};
+    my $eval_mode = lc($pol->{evaluation_mode} || "any_ok");
+
+    my (@found, @notes);
+    for my $sel (@selectors) {
+        my $name = "$sel._domainkey.$domain";
+        my ($txt_ref, $cname_target) = get_txt_records_follow_cname($resolver, $name, $timeout);
+        my @txt = @$txt_ref;
+
+        if ($cname_target) {
+            push @notes, "DKIM $sel: Verweist via CNAME auf $cname_target";
+        }
+
+        # DKIM Record identifizieren (v=DKIM1 muss nicht zwingend am Anfang stehen, ist aber üblich)
+        my ($rec) = grep { /v=DKIM1/i } @txt;
+        # Falls kein v=DKIM1 da ist, aber TXT Records existieren, 
+        # besagt RFC 6376, dass es trotzdem DKIM sein kann (v ist optional).
+        ($rec) = @txt if !defined $rec && @txt;
+
+        next unless $rec;
+
+        my $kv = parse_dkim_txt_kv($rec);
+        my $v_tag = lc($kv->{v} // "");
+        my $k_tag = lc($kv->{k} // "rsa");
+
+        # Prüfung der Tags
+        my $ok_contains = ($v_tag eq "" || $v_tag eq "dkim1") && ($k_tag eq "rsa" || $k_tag eq "ed25519");
+        
+        # Abgleich mit Erwartungswert aus Profil
+        my $ok_expected = 1;
+        if (ref($expected) eq 'HASH' && exists $expected->{$sel}) {
+            my $want = $expected->{$sel} // "";
+            if (_trim($want) ne "") {
+                $ok_expected = dkim_expected_match($rec, $want) ? 1 : 0;
+                push @notes, "DKIM $sel: Record-Inhalt entspricht nicht der Vorgabe" unless $ok_expected;
+            }
+        }
+
+        # Key-Stärke und Revocation prüfen
+        my ($bits, $type_or_err) = dkim_key_bits_rsa($rec);
+        my $strength = "unknown";
+        my $is_revoked = 0;
+
+        if ($type_or_err eq "revoked") {
+            $is_revoked = 1;
+            $strength = "revoked";
+            push @notes, "DKIM $sel: Schlüssel wurde widerrufen (p= leer)";
+        }
+        elsif ($type_or_err eq "ed25519") {
+            $strength = "ok";
+        }
+        elsif ($bits) {
+            if ($bits < MIN_RSA_KEY_BITS) {
+                $strength = "weak";
+                push @notes, "DKIM $sel: RSA Schlüssel ist zu schwach ($bits Bit)";
+            } else {
+                $strength = "ok";
+            }
+        } else {
+            push @notes, "DKIM $sel: Schlüsselprüfung fehlgeschlagen ($type_or_err)";
+        }
+
+        push @found, {
+            selector     => $sel,
+            record       => $rec,
+            cname_target => ($cname_target // ""),
+            ok_contains  => $ok_contains ? 1 : 0,
+            ok_expected  => $ok_expected ? 1 : 0,
+            key_bits     => $bits,
+            key_strength => $strength,
+            is_revoked   => $is_revoked,
+        };
+    }
+
+    # Wenn gar kein Selektor gefunden wurde
+    unless (@found) {
+        return {
+            status  => "fail",
+            message => "Kein DKIM Record für die Selektoren gefunden: " . join(", ", @selectors),
+            rfc     => "RFC 6376",
+            found   => [],
+            notes   => \@notes,
+        };
+    }
+
+    # Ergebnis-Auswertung (Evaluation)
+    my @individual_results;
+    for my $f (@found) {
+        if ($f->{is_revoked}) {
+            push @individual_results, "warn"; # Revoked ist kein Fail, aber ein Achtung-Signal
+        } elsif ($f->{ok_contains} && $f->{ok_expected} && $f->{key_strength} eq "ok") {
+            push @individual_results, "ok";
+        } elsif ($f->{key_strength} eq "weak") {
+            push @individual_results, "warn";
+        } else {
+            push @individual_results, "fail";
+        }
+    }
+
+    my $status = "fail";
+    if ($eval_mode eq "all_ok") {
+        $status = (grep { $_ ne "ok" } @individual_results) ? "fail" : "ok";
+        # Wenn alles "ok" oder "warn" ist, stufen wir auf warn zurück statt fail
+        if ($status eq "fail" && !(grep { $_ eq "fail" } @individual_results)) {
+            $status = "warn";
+        }
+    } else {
+        # default: any_ok
+        $status = (grep { $_ eq "ok" } @individual_results) ? "ok" : 
+                  (grep { $_ eq "warn" } @individual_results) ? "warn" : "fail";
+    }
+
+    return {
+        status  => $status,
+        message => $status eq "ok" ? "DKIM Prüfung erfolgreich" : 
+                   $status eq "warn" ? "DKIM vorhanden mit Warnungen" : "DKIM Policy verletzt",
+        rfc     => "RFC 6376",
+        found   => \@found,
+        notes   => \@notes,
+    };
+}
+
+# --- Checks: ARC ---
+sub check_arc {
+    my ($resolver, $domain, $profile, $timeout) = @_;
+    return { status => "skip", message => "ARC nicht gefordert", rfc => "RFC 8617", found => [] }
+        unless $profile->{require_arc};
+
+    my @selectors = _as_list($profile->{arc_selectors});
+    unless (@selectors) {
+        return {
+            status  => "fail",
+            message => "Keine ARC Selektoren definiert",
+            rfc     => "RFC 8617",
+            found   => [],
+        };
+    }
+
+    my @found;
+    for my $sel (@selectors) {
+        my $name = "$sel._domainkey.$domain";
+        my ($txt_ref, $cname_target) = get_txt_records_follow_cname($resolver, $name, $timeout);
+        my @txt = @$txt_ref;
+
+        my ($rec) = grep { /^v=(DKIM1|ARC1)(\s|;|$)/i } @txt;
+        next unless $rec;
+
+        my ($bits, $type_or_err) = dkim_key_bits_rsa($rec);
+        my $strength = "unknown";
+        my $is_revoked = 0;
+
+        if ($type_or_err eq "revoked") {
+            $is_revoked = 1;
+            $strength = "revoked";
+        }
+        elsif ($type_or_err eq "ed25519") {
+            $strength = "ok";
+        }
+        elsif ($bits) {
+            $strength = $bits < MIN_RSA_KEY_BITS ? "weak" : "ok";
+        }
+
+        push @found, {
+            selector     => $sel,
+            record       => $rec,
+            cname_target => ($cname_target // ""),
+            key_bits     => $bits,
+            key_strength => $strength,
+            is_revoked   => $is_revoked,
+            key_error    => ($bits || $is_revoked ? "" : $type_or_err),
+        };
+    }
+
+    unless (@found) {
+        return {
+            status  => "fail",
+            message => "Kein ARC Key gefunden",
+            rfc     => "RFC 8617",
+            found   => [],
+        };
+    }
+
+    my $status = "ok";
+    # Warnung wenn ein Key schwach oder widerrufen ist
+    if (grep { $_->{key_strength} eq 'weak' || $_->{is_revoked} } @found) {
+        $status = "warn";
+    }
+
+    return {
+        status  => $status,
+        message => $status eq "ok" ? "ARC Keys vorhanden" : "ARC Keys vorhanden mit Warnungen",
+        rfc     => "RFC 8617",
+        found   => \@found,
+    };
+}
+
+# --- Checks: MTA-STS ---
+sub fetch_mta_sts_policy {
+    my ($domain, $timeout) = @_;
+    $timeout //= 6;
+    my $url = "https://mta-sts.$domain/.well-known/mta-sts.txt";
+    my $http = HTTP::Tiny->new(
+        timeout     => $timeout,
+        verify_SSL  => 1,
+        agent       => "domain_dns_audit/@{[VERSION]}",
+    );
+
+    my $cur = $url;
+    for (my $i = 0; $i <= MAX_HTTP_REDIRECTS; $i++) {
+        my $res = $http->get($cur);
+        unless ($res) {
+            return (0, "HTTP request fehlgeschlagen", "", $cur);
+        }
+
+        # Handling von Redirects
+        if ($res->{status} =~ /^(301|302|303|307|308)$/) {
+            my $loc = _trim($res->{headers}{location} // "");
+            unless ($loc) {
+                return (0, "Redirect ohne Location Header", "", $cur);
+            }
+            unless ($loc =~ m/^https:\/\//i) {
+                return (0, "Redirect nicht https: $loc", "", $cur);
+            }
+            $cur = $loc;
+            next;
+        }
+
+        # Prüfung, ob der Status-Code 200-299 ist
+        unless ($res->{success}) {
+            return (0, "HTTP status $res->{status}", "", $cur);
+        }
+
+        # --- NEU: RFC 8461 Content-Type Check ---
+        # HTTP::Tiny speichert Header-Keys immer in Kleinschreibung
+        my $ct = $res->{headers}{'content-type'} // "";
+        unless ($ct =~ m|^text/plain|i) {
+            return (0, "Falscher Content-Type: $ct (erwartet text/plain)", "", $cur);
+        }
+        # ----------------------------------------
+
+        my $body = $res->{content} // "";
+        unless (length($body) > 0) {
+            return (0, "Empty policy body", "", $cur);
+        }
+
+        return (1, "OK", $body, $cur);
+    }
+
+    return (0, "Zu viele Redirects", "", $cur);
+}
+
+sub parse_mta_sts_policy {
+    my ($body) = @_;
+    my %kv;
+    for my $line (split /\n/, $body) {
+        $line =~ s/\r$//;
+        $line =~ s/^\s+|\s+$//g;
+        next if $line eq "" || $line =~ /^\s*#/;
+        if ($line =~ /^([a-zA-Z_]+)\s*:\s*(.+)$/) {
+            $kv{lc($1)} = $2;
+        }
+    }
+    return \%kv;
+}
+
+sub check_mta_sts {
+    my ($resolver, $domain, $profile, $timeout) = @_;
+    return { status => "skip", message => "MTA-STS nicht gefordert", rfc => "RFC 8461" }
+        unless $profile->{require_mta_sts};
+
+    my $name = "_mta-sts.$domain";
+    my @txt = get_txt_records($resolver, $name, $timeout);
+    my ($sts) = grep { /^v=STSv1(\s|;|$)/i } @txt;
+
+    unless ($sts) {
+        return {
+            status  => "fail",
+            message => "Kein MTA-STS TXT Record gefunden",
+            rfc     => "RFC 8461",
+            record  => "",
+        };
+    }
+
+    my ($ok, $msg, $body, $url) = fetch_mta_sts_policy($domain, 6);
+    unless ($ok) {
+        return {
+            status   => "fail",
+            message  => "MTA-STS Policy nicht abrufbar",
+            rfc      => "RFC 8461",
+            record   => $sts,
+            policy_url => $url,
+            notes    => [$msg],
+        };
+    }
+
+    my $kv = parse_mta_sts_policy($body);
+    my @notes;
+    my $want_mode = lc($profile->{mta_sts_mode} // "");
+    my $want_max_age = $profile->{mta_sts_max_age};
+
+    if ($want_mode) {
+        my $is_mode = lc($kv->{mode} // "");
+        push @notes, "Policy mode stimmt nicht" if $is_mode ne $want_mode;
+    }
+
+    if (defined $want_max_age) {
+        my $ma = $kv->{max_age};
+        if (!defined $ma || $ma !~ /^\d+$/) {
+            push @notes, "Policy max_age fehlt/ungültig";
+        }
+        elsif (int($ma) < int($want_max_age)) {
+            push @notes, "Policy max_age zu klein";
+        }
+    }
+
+    return {
+        status     => @notes ? "fail" : "ok",
+        message    => @notes ? "MTA-STS Policy verletzt" : "MTA-STS OK",
+        rfc        => "RFC 8461",
+        record     => $sts,
+        policy_url => $url,
+        policy     => $kv,
+        notes      => \@notes,
+    };
+}
+
+# --- Checks: DANE ---
+sub check_dane {
+    my ($resolver, $domain, $profile, $timeout) = @_;
+    return { status => "skip", message => "DANE nicht gefordert", rfc => "RFC 7672" }
+        unless $profile->{require_dane};
+
+    my @mx = get_mx_records($resolver, $domain, $timeout);
+    unless (@mx) {
+        return { status => "fail", message => "Kein MX, DANE nicht prüfbar", rfc => "RFC 7672" };
+    }
+
+    my @ports = _as_list($profile->{dane_ports});
+    @ports = (25) unless @ports;
+
+    my @tlsa;
+    my $dnssec_valid = 1; # Wir gehen davon aus, bis wir einen Fehler finden
+    my @notes;
+
+    for my $mxh (map { $_->{exchange} } @mx) {
+        $mxh =~ s/\.$//;
+        next unless $mxh;
+
+        for my $port (@ports) {
+            my $name = "_" . int($port) . "._tcp.$mxh";
+            my $pkt = safe_dns_query($resolver, $name, 'TLSA', 1, 2);
+            next unless $pkt;
+
+            # --- NEU: DNSSEC Authenticated Data (AD) Flag prüfen ---
+            unless ($pkt->header->ad) {
+                $dnssec_valid = 0;
+                push @notes, "DANE Record für $mxh gefunden, aber NICHT per DNSSEC verifiziert (AD-Flag fehlt).";
+            }
+            # -------------------------------------------------------
+
+            for my $rr ($pkt->answer) {
+                next unless $rr->type eq "TLSA";
+                push @tlsa, {
+                    mx          => $mxh,
+                    port        => int($port),
+                    usage       => $rr->usage,
+                    selector    => $rr->selector,
+                    matchingtype => $rr->matchingtype,
+                    certdata    => $rr->certdata,
+                };
+            }
+        }
+    }
+
+    unless (@tlsa) {
+        return {
+            status  => "fail",
+            message => "Keine TLSA Records gefunden",
+            rfc     => "RFC 7672",
+            tlsa    => [],
+        };
+    }
+
+    # DANE ist nur OK, wenn Records da sind UND DNSSEC sie schützt
+    my $status = $dnssec_valid ? "ok" : "fail";
+
+    return {
+        status  => $status,
+        message => $status eq "ok" ? "DANE TLSA vorhanden und DNSSEC-validiert" 
+                                   : "DANE vorhanden, aber durch fehlendes DNSSEC wertlos",
+        rfc     => "RFC 7672",
+        ports   => \@ports,
+        tlsa    => \@tlsa,
+        notes   => \@notes,
+    };
+}
+
+# --- Hauptlogik ---
+sub run_checks_for_profile {
+    my ($resolver, $domain, $profile, $timeout, $fast) = @_;
+    my $need_dane    = $fast ? ($profile->{require_dane}    ? 1 : 0) : 1;
+    my $need_mta_sts = $fast ? ($profile->{require_mta_sts} ? 1 : 0) : 1;
+
+    my $checks = {
+        mx      => check_mx($resolver, $domain, $profile, $timeout),
+        spf     => check_spf($resolver, $domain, $profile, $timeout),
+        dkim    => check_dkim($resolver, $domain, $profile, $timeout),
+        arc     => check_arc($resolver, $domain, $profile, $timeout),
+        dmarc   => check_dmarc($resolver, $domain, $profile, $timeout),
+        dane    => $need_dane    ? check_dane($resolver, $domain, $profile, $timeout) : { status => "skip", message => "DANE nicht gefordert", rfc => "RFC 7672" },
+        mta_sts => $need_mta_sts ? check_mta_sts($resolver, $domain, $profile, $timeout) : { status => "skip", message => "MTA-STS nicht gefordert", rfc => "RFC 8461" },
+    };
+
+    my @statuses = map { $_->{status} } values %$checks;
+    return { status => worst_status(@statuses), checks => $checks };
+}
 
 sub process_domain {
-    my ($dom, $resolver) = @_;
+    my ($domain, $timeout, $fast) = @_;
+    my $resolver = build_resolver($DNS_CONF);
+    my %profile_results;
+    my $best_status = "fail";
 
-    $log->info("Pruefe Domain: $dom");
-
-    my $dom_result;
-
-    eval {
-        my %profile_results;
-        my $best_profile;
-        my $best_status = 'fail';
-
-        for my $pname (sort keys %{$PROFILE_CONF}) {
-            my $p = $PROFILE_CONF->{$pname} || {};
-
-            my $mx    = check_mx($resolver, $dom,    $p->{mx_policy}   || $GLOBAL_MX_POLICY);
-            my $spf   = check_spf($resolver, $dom,   $p, $GLOBAL_SPF_POLICY);
-            my $dmarc = check_dmarc($resolver, $dom, $p, $GLOBAL_DMARC_POLICY);
-            my $dkim  = check_dkim($resolver, $dom,  $p, $GLOBAL_DKIM_POLICY);
-
-            my @st = map { $_->{status} } ($mx, $spf, $dmarc, $dkim);
-
-            my $profile_status = "ok";
-            if (grep { $_ eq "fail" } @st) {
-                $profile_status = "fail";
-            } elsif (grep { $_ eq "warn" } @st) {
-                $profile_status = "warn";
-            }
-
-            $profile_results{$pname} = {
-                status => $profile_status,
-                checks => {
-                    mx    => $mx,
-                    spf   => $spf,
-                    dmarc => $dmarc,
-                    dkim  => $dkim,
-                },
-            };
-
-            if ($profile_status eq 'ok') {
-                if ($best_status ne 'ok') {
-                    $best_status  = 'ok';
-                    $best_profile = $pname;
-                }
-            } elsif ($profile_status eq 'warn') {
-                if ($best_status eq 'fail') {
-                    $best_status  = 'warn';
-                    $best_profile = $pname;
-                }
-            } elsif (!$best_profile) {
-                $best_status  = 'fail';
-                $best_profile = $pname;
-            }
-        }
-
-        my $dom_status = $best_status || 'fail';
-
-        $dom_result = {
-            domain              => $dom,
-            status              => $dom_status,
-            best_profile        => $best_profile,
-            best_profile_status => $best_status,
-            profiles            => \%profile_results,
-        };
-
-        1;
-    } or do {
-        my $err = $@ || 'Unbekannter Fehler';
-        $log->error("Fehler bei Domain $dom: $err");
-
-        $dom_result = {
-            domain => $dom,
-            status => 'fail',
-            error  => "$err",
-        };
-    };
-
-    return $dom_result;
-}
-
-# =========================
-# Hauptlogik mit Parallel::ForkManager
-# =========================
-
-my @domains;
-
-if ($opt_domain) {
-    @domains = (lc $opt_domain);
-    $log->info("Nur Single Domain Modus aktiv: $opt_domain");
-} else {
-    if ($LDAP_ENABLED) {
-        @domains = eval { fetch_domains_from_ldap() };
-        if ($@) {
-            $log->error("Fehler beim LDAP Abruf: $@");
-            print STDERR "Fehler beim LDAP Abruf: $@\n";
-            exit 1;
-        }
-    } else {
-        $log->info("LDAP ist deaktiviert, verwende nur extra_domains");
-        @domains = ();
+    for my $pname (sort keys %$PROFILE_CONF) {
+        my $p = $PROFILE_CONF->{$pname} // next;
+        next unless profile_matches_domain($p, $domain);
+        $profile_results{$pname} = run_checks_for_profile($resolver, $domain, $p, $timeout, $fast);
+        my $st = $profile_results{$pname}{status};
+        $best_status = $st if $st eq "ok" ||
+                       ($st eq "warn" && $best_status ne "ok") ||
+                       ($best_status eq "fail");
     }
 
-    push @domains, @EXTRA_DOMAINS if @EXTRA_DOMAINS;
+    if (!%profile_results && exists $PROFILE_CONF->{default}) {
+        my $p = $PROFILE_CONF->{default};
+        $profile_results{default} = run_checks_for_profile($resolver, $domain, $p, $timeout, $fast);
+        $best_status = $profile_results{default}{status};
+    }
+
+    return { domain => $domain, status => $best_status, profiles => \%profile_results };
+}
+
+# --- Main ---
+sub main {
+    my $config_file = $opt_config // $DEFAULT_CONFIG;
+    $conf = load_config($config_file);
+    $PROFILE_CONF = $conf->{profiles} // {};
+    $DNS_CONF     = $conf->{dns}      // {};
+    $DOMAINS_CONF = $conf->{domains}  // {};
+    $OUT_CONF     = $conf->{output}   // {};
+    $RUNTIME_CONF = $conf->{runtime}  // {};
+
+    # Logging
+    my $LOG_FILE  = $OUT_CONF->{log_file} // File::Spec->catfile($BASE, "log", "domain_dns_audit.log");
+    my $LOG_LEVEL = $opt_debug ? "DEBUG" : ($OUT_CONF->{log_level} // "INFO");
+    make_path(dirname($LOG_FILE)) unless -d dirname($LOG_FILE);
+
+    Log::Log4perl::init(\<<~"LOG_CONFIG");
+        log4perl.logger          = $LOG_LEVEL, LOGFILE, CONSOLE
+        log4perl.appender.LOGFILE = Log::Log4perl::Appender::File
+        log4perl.appender.LOGFILE.filename = $LOG_FILE
+        log4perl.appender.LOGFILE.mode     = append
+        log4perl.appender.LOGFILE.layout   = Log::Log4perl::Layout::PatternLayout
+        log4perl.appender.LOGFILE.layout.ConversionPattern = %d [%p] %m%n
+        log4perl.appender.LOGFILE.binmode  = :encoding(UTF-8)
+        log4perl.appender.CONSOLE = Log::Log4perl::Appender::ScreenColoredLevels
+        log4perl.appender.CONSOLE.layout = Log::Log4perl::Layout::PatternLayout
+        log4perl.appender.CONSOLE.layout.ConversionPattern = %d [%p] %m%n
+        LOG_CONFIG
+
+    $log = Log::Log4perl->get_logger();
+    $log->info("Starte domain_dns_audit v@{[VERSION]} (Fast: " . ($opt_fast ? "ja" : "nein") . ")");
+	
+	$PSL_REF = load_public_suffix_list($conf->{public_suffix_list});
+
+	if ($PSL_REF) {
+		$log->info("Public Suffix List erfolgreich geladen.");
+	} else {
+		$log->warn("Audit läuft OHNE Public Suffix List (nutze einfache Heuristik).");
+	}
+
+
+    # Domains laden
+    $MAX_PROCS = $opt_max_procs // $RUNTIME_CONF->{max_procs} // 1;
+    my @domains = $opt_domain
+        ? (lc $opt_domain)
+        : _as_list($DOMAINS_CONF->{static_domains} // $DOMAINS_CONF->{list} // $DOMAINS_CONF->{domains} // []);
+
+    @domains = grep { is_valid_domain($_) } @domains;
+    my @exclude = _as_list($DOMAINS_CONF->{exclude_domains});
+    if (@exclude) {
+        my $exset = _lcset(@exclude);
+        @domains = grep { !$exset->{lc($_)} } @domains;
+    }
 
     my %seen;
-    @domains = grep { !$seen{$_}++ } @domains;
+    @domains = grep { !$seen{lc($_)}++ } @domains;
 
-    if (@EXCLUDE_DOMAINS) {
-        my %excl = map { $_ => 1 } @EXCLUDE_DOMAINS;
-        my @before = @domains;
-        @domains = grep { !$excl{$_} } @domains;
-
-        my @removed = grep { $excl{$_} } @before;
-        if (@removed) {
-            $log->info("Ausgeschlossene Domains: " . join(", ", @removed));
-        }
+    unless (@domains) {
+        $log->error("Keine Domains zum Prüfen gefunden!");
+        exit 2;
     }
-}
 
-if (!@domains) {
-    $log->warn("Keine Domains zu pruefen nach Exclude Filter oder CLI Auswahl");
-}
+    $log->info("Domains: " . scalar(@domains) . " (Parallelität: $MAX_PROCS)");
 
-my @results;
+    # Parallelisierung
+    my $pm = Parallel::ForkManager->new($MAX_PROCS);
+    my %results;
 
-my $pm = Parallel::ForkManager->new($MAX_PROCS);
-
-$pm->run_on_finish(
-    sub {
+    $pm->run_on_finish(sub {
         my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $data_ref) = @_;
-        if ($data_ref && ref $data_ref eq 'HASH') {
-            push @results, $data_ref;
-        } else {
-            $log->warn("Kindprozess $pid hat keine gueltigen Daten geliefert (exit_code=$exit_code)");
-        }
+        return unless $data_ref && ref($data_ref) eq 'HASH';
+        $results{$data_ref->{domain}} = $data_ref->{result};
+    });
+
+    for my $dom (@domains) {
+        $pm->start and next;
+        my $r = try {
+            process_domain($dom, $DNS_CONF->{timeout} // DEFAULT_DNS_TIMEOUT, $opt_fast);
+        } catch {
+            $log->error("Fehler bei $dom: $_");
+            { domain => $dom, status => "fail", error => "$_" };
+        };
+        $pm->finish(0, { domain => $dom, result => $r });
     }
-);
+    $pm->wait_all_children;
 
-for my $dom (@domains) {
-    $pm->start and next;
-
-    my $child_resolver = Net::DNS::Resolver->new(%resolver_opts);
-    $child_resolver->persistent_udp(1);
-    $child_resolver->persistent_tcp(1);
-
-    my $dom_result = process_domain($dom, $child_resolver);
-
-    $pm->finish(0, $dom_result);
-}
-
-$pm->wait_all_children;
-
-@results = sort {
-    (lc($a->{domain} // '')) cmp (lc($b->{domain} // ''))
-} @results;
-
-my $global_status = "ok";
-
-if (!@domains) {
-    $global_status = "warn";
-    $log->warn("Keine Domains zu pruefen, globaler Status auf WARN gesetzt");
-} else {
-    for my $dom_result (@results) {
-        my $dom_status = $dom_result->{status} // 'fail';
-
-        if ($dom_status eq "fail") {
-            $global_status = "fail";
-            last;
-        } elsif ($dom_status eq "warn" and $global_status eq "ok") {
-            $global_status = "warn";
-        }
-    }
-}
-
-my $date_str    = strftime("%Y%m%d", localtime);
-my $json_target = $JSON_FILE;
-
-if ($json_target =~ /(.*)\.json$/i) {
-    $json_target = $1 . "_" . $date_str . ".json";
-} else {
-    $json_target = $json_target . "_" . $date_str;
-}
-
-my $summary = {
-    timestamp     => strftime("%Y-%m-%dT%H:%M:%S", localtime),
-    config_file   => $config_file,
-    tool_version  => $VERSION,
-    report_file   => $json_target,
-    global_status => $global_status,
-    domains_total => scalar(@domains),
-    results       => \@results,
-};
-
-my $report_write_error = 0;
-
-if ($opt_dry_run) {
-    $log->info("Dry-Run aktiv: JSON Report wird NICHT geschrieben (global_status=$global_status, target=$json_target)");
-} else {
-    eval {
-        my $json = encode_json($summary);
-
-        my ($vol, $dir, undef) = File::Spec->splitpath($json_target);
-        my $path_dir = File::Spec->catpath($vol, $dir, "");
-
-        if ($path_dir && !-d $path_dir) {
-            File::Path::make_path($path_dir) or die "Kann Verzeichnis nicht erstellen: $path_dir: $!";
-        }
-
-		open my $fh, '>:raw', $json_target
-		  or die "Kann JSON File nicht schreiben: $json_target: $!";
-		print {$fh} $json or die "Fehler beim Schreiben in $json_target: $!";
-		close $fh or warn "Fehler beim Schliessen von $json_target: $!";
-
-
-        $log->info("JSON Report nach $json_target geschrieben");
-        1;
-    } or do {
-        my $err = $@ || "Unbekannter Fehler";
-        $report_write_error = 1;
-        $log->error("Fehler beim Schreiben des JSON Reports: $err");
+    # Report schreiben
+    my $date = strftime("%Y%m%d", localtime);
+    my $final_data = {
+        ts      => time,
+        date    => $date,
+        version => VERSION,
+        fast    => $opt_fast ? 1 : 0,
+        domains => \%results,
     };
+
+    my $out_file = dated_output_path($OUT_CONF->{json_file}, $date);
+    if ($opt_dry_run) {
+        $log->info("Dry-Run: Kein Report geschrieben.");
+    } else {
+        atomic_write_json($out_file, $final_data);
+        $log->info("Report geschrieben: $out_file");
+    }
 }
 
-$log->info("Fertig, globaler Status: $global_status (Version $VERSION, report_write_error=$report_write_error)");
-
-my $report_info = $opt_dry_run
-    ? "Report: (dry-run, kein File geschrieben, Target $json_target)"
-    : ($report_write_error ? "Report: FEHLER beim Schreiben (Target $json_target)" : "Report: $json_target");
-
-print "domain_dns_audit v$VERSION: $global_status (Domains: "
-    . scalar(@domains) . ", $report_info)\n";
-
-if ($report_write_error) {
-    exit 2;
-} elsif ($global_status eq "ok") {
-    exit 0;
-} elsif ($global_status eq "warn") {
-    exit 1;
-} else {
-    exit 2;
-}
+main();
