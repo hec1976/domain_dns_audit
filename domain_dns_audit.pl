@@ -1462,8 +1462,12 @@ sub check_dane {
     @ports = (25) unless @ports;
 
     my @tlsa;
-    my $dnssec_valid = 1; # wir gehen davon aus, bis wir einen Fehler finden
     my @notes;
+
+    # Wir merken uns AD nur aggregiert, damit die Notes nicht explodieren
+    my $saw_tlsa       = 0;  # mindestens ein TLSA Record gefunden
+    my $saw_ad_missing = 0;  # bei mind. einem TLSA fehlte AD
+    my $saw_ad_ok      = 0;  # bei mind. einem TLSA war AD gesetzt (Info)
 
     for my $mxh (map { $_->{exchange} } @mx) {
         $mxh =~ s/\.$//;
@@ -1471,19 +1475,19 @@ sub check_dane {
 
         for my $port (@ports) {
             my $name = "_" . int($port) . "._tcp.$mxh";
-            my $pkt = safe_dns_query($resolver, $name, 'TLSA', 1, 2);
+            my $pkt  = safe_dns_query($resolver, $name, 'TLSA', 1, 2);
             next unless $pkt;
 
             my $ad = 0;
             $ad = 1 if ($pkt && $pkt->header && $pkt->header->ad);
 
-            unless ($ad) {
-                $dnssec_valid = 0;
-                push @notes, "Hinweis: TLSA für $mxh gefunden, aber AD-Flag fehlt (Resolver validiert DNSSEC moeglicherweise nicht).";
-            }
-
             for my $rr ($pkt->answer) {
                 next unless $rr->type eq "TLSA";
+
+                $saw_tlsa = 1;
+                $saw_ad_ok = 1 if $ad;
+                $saw_ad_missing = 1 unless $ad;
+
                 push @tlsa, {
                     mx           => $mxh,
                     port         => int($port),
@@ -1506,16 +1510,24 @@ sub check_dane {
     }
 
     my $status;
-    if ($dnssec_valid) {
+
+    # Wenn bei keinem TLSA AD fehlte, ist es ok
+    if (!$saw_ad_missing) {
         $status = "ok";
     } else {
+        # TLSA vorhanden, aber AD fehlt mindestens einmal
         if ($dnssec_status eq "ok") {
             $status = "warn";
-            push @notes, "Hinweis: DNSSEC (DS) ist vorhanden, aber AD-Flag fehlt. DANE Verifikation haengt vom Resolver ab.";
+            push @notes, "Hinweis: TLSA vorhanden, aber AD-Flag fehlt mindestens einmal. Resolver validiert DNSSEC moeglicherweise nicht, DANE Verifikation ist damit nicht sicher.";
         } else {
             $status = "fail";
-            push @notes, "FEHLER: Keine DNSSEC Basis (DS fehlt oder DNSSEC nicht aktiv). DANE ist damit nicht verifizierbar.";
+            push @notes, "FEHLER: TLSA vorhanden, aber keine DNSSEC Basis (DS fehlt oder DNSSEC nicht aktiv). DANE ist damit nicht verifizierbar.";
         }
+    }
+
+    # Optionaler Zusatzhinweis: AD war nie gesetzt, obwohl TLSA gefunden wurde
+    if ($saw_tlsa && !$saw_ad_ok) {
+        push @notes, "Hinweis: AD-Flag war bei allen TLSA Antworten 0. Falls dein Resolver nicht validiert, kann das zu Warnungen fuehren.";
     }
 
     return {
@@ -1531,12 +1543,16 @@ sub check_dane {
 }
 
 
+
 # --- Hauptlogik ---
 sub run_checks_for_profile {
     my ($resolver, $domain, $profile, $timeout, $fast) = @_;
+
+    # Fast Mode: DANE / MTA-STS nur wenn wirklich gefordert
     my $need_dane    = $fast ? ($profile->{require_dane}    ? 1 : 0) : 1;
     my $need_mta_sts = $fast ? ($profile->{require_mta_sts} ? 1 : 0) : 1;
 
+    # DNSSEC zuerst, damit wir den Status an DANE weitergeben koennen
     my $dnssec_res = check_dnssec_zone($resolver, $domain, $timeout);
 
     my $checks = {
@@ -1556,9 +1572,14 @@ sub run_checks_for_profile {
             : { status => "skip", message => "MTA-STS nicht gefordert", rfc => "RFC 8461" },
     };
 
-    my @statuses = map { $_->{status} } values %$checks;
-    return { status => worst_status(@statuses), checks => $checks };
+    my @statuses = map { $_->{status} // "fail" } values %$checks;
+
+    return {
+        status => worst_status(@statuses),
+        checks => $checks,
+    };
 }
+
 
 
 sub process_domain {
