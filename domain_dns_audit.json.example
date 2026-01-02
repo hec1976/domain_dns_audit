@@ -1,188 +1,145 @@
 {
-  "ldap": {
-    "enabled": false,
-    "ldapconfigpath": "/opt/script/domain-check/domain_dns_ldap.json"
-  },
+  "version": "2.7.0",
+  "description": "Beispielconfig domain_dns_audit (fiktive Daten, 2 Profile)",
 
-  "dns": {
-    "servers": [
-      "8.8.8.8",
-      "1.1.1.1"
-    ],
-    "timeout": 5,
-    "udp_timeout": 2,
-    "tcp_timeout": 4
-  },
-
-  "runtime": {
-    "max_procs": 20
-  },
+  "public_suffix_list": "/opt/domain_dns_audit/script/public_suffix_list.dat",
 
   "domains": {
-    "extra_domains": [
-      "example.org",
-      "gw1.example.org",
-      "gw2.example.org",
-      "example.net",
-      "gateway1.example.net",
-      "example.ch"
+    "static_domains": [
+      "example.ch",
+      "mail.example.ch",
+      "example-ag.ch",
+      "shop.example-ag.ch"
     ],
     "exclude_domains": [
-      "dummy.internal.example"
+      "test.example.ch"
     ]
   },
 
-  "check": {
-    "require_spf": true,
-    "require_dkim": true,
+  "profiles": {
+    "full": {
+      "description": "Vollstaendiges Profil fuer produktive Mail Domains",
 
-    "dmarc_ok_policies": [
-      "reject",
-      "quarantine"
-    ],
-
-    "dkim_selectors": [
-      "dkimk1",
-      "dkimk2"
-    ],
-    "dkim_txt_required_contains": [
-      "v=DKIM1",
-      "k=rsa"
-    ],
-
-    "mx_policy": {
-      "groups": [
-        {
-          "name": "example_mx",
-          "mx_required": [
-            "mx01.example.org",
-            "mx02.example.org"
-          ],
-          "mx_allow_others": false
-        }
-      ]
-    },
-
-    "spf_policy": {
-      "defaults": {
-        "allowed_modes": [
-          "soft",
-          "hard"
-        ],
-        "forbid_open": true
-      },
-      "groups": [
-        {
-          "name": "example_spf_group_a",
-          "required_contains": [
-            "redirect=_spfga.example.org"
-          ]
-        },
-        {
-          "name": "example_spf_group_b",
-          "required_contains": [
-            "redirect=_spfgb.example.org"
-          ]
-        }
-      ]
-    },
-
-    "dkim_policy": {
-      "evaluation_mode": "all_ok",
-      "expected_txt": {
-        "dkimk1": "v=DKIM1; k=rsa; p=MIIEXAMPLEKEYFOR_DKIMK1_EXAMPLE_1234567890",
-        "dkimk2": "v=DKIM1; k=rsa; p=MIIEXAMPLEKEYFOR_DKIMK2_EXAMPLE_ABCDEFGHIJ"
-      }
-    },
-
-    "dmarc_policy": {
-      "ok_policies": [
-        "reject",
-        "quarantine"
-      ],
-      "require_rua": true,
-      "allow_external_rua_domains": [
-        "example.org"
-      ],
-      "require_external_authorization": true
-    },
-
-    "profiles": {
-      "on_prem_strict": {
-        "description": "On Prem Profil fuer example.org (nutzt globale MX/SPF/DMARC/DKIM Policies)"
+      "match": {
+        "suffixes": ["*.example.ch", "*.example-ag.ch"]
       },
 
-      "cloud_gateway": {
-        "description": "Beispielprofil fuer ein externes Cloud Gateway",
-        "require_dkim": false,
-        "dmarc_ok_policies": [
-          "quarantine"
-        ],
+      "require_mx": true,
+      "require_spf": true,
+      "require_dkim": true,
+      "require_dmarc": true,
+      "require_arc": true,
+      "require_dane": true,
+      "require_mta_sts": true,
+      "require_tls_rpt": true,
+      "require_bimi": true,
 
-        "dkim_selectors": [
-          "dkimk1",
-          "dkimk2"
-        ],
-        "dkim_txt_required_contains": [
-          "v=DKIM1",
-          "k=rsa"
-        ],
+      "dmarc_strict_alignment": true,
+      "dmarc_ok_policies": ["reject"],
 
-        "dkim_policy": {
-          "evaluation_mode": "any_ok",
-          "expected_txt": {
-            "dkimk1": "v=DKIM1;k=rsa; p=HIER_CLOUD_KEY_1_BASE64",
-            "dkimk2": "v=DKIM1;k=rsa; p=HIER_CLOUD_KEY_2_BASE64"
-          }
-        },
+      "dkim_selectors": ["s1", "s2"],
+      "arc_selectors": ["arc", "arc1"],
+      "dane_ports": [25],
 
-        "mx_policy": {
-          "groups": [
-            {
-              "name": "cloud_mx",
-              "mx_required": [
-                "inbound.gateway1.example.net"
-              ],
-              "mx_allow_others": true
-            }
-          ]
-        },
+      "mta_sts_mode": "enforce",
+      "mta_sts_max_age": 604800,
 
-        "spf_policy": {
-          "defaults": {
-            "allowed_modes": [
-              "soft",
-              "neutral"
+      "mx_policy": {
+        "groups": [
+          {
+            "name": "Primary MX",
+            "mx_required": [
+              "mx01.mail-gw.example.ch",
+              "mx02.mail-gw.example.ch"
             ],
-            "forbid_open": true
-          },
-          "groups": [
-            {
-              "name": "cloud_spf",
-              "required_contains": [
-                "include:_spfgw.example.net"
-              ]
-            }
-          ]
-        },
+            "mx_allow_others": false
+          }
+        ]
+      },
 
-        "dmarc_policy": {
-          "ok_policies": [
-            "quarantine"
-          ],
-          "require_rua": true,
-          "allow_external_rua_domains": [
-            "dmarc-analyzer.example"
-          ],
-          "require_external_authorization": true
+      "spf_policy": {
+        "groups": [
+          {
+            "name": "SPF Grundregeln",
+            "allowed_modes": ["hard", "soft"],
+            "required_contains": [
+              "include:spf1.example-mail.net"
+            ],
+            "required_contains_any": [
+              "redirect=_spf.example.ch",
+              "include:spf2.example-mail.net"
+            ]
+          }
+        ]
+      },
+
+      "dmarc_policy": {
+        "allow_external_rua_domains": ["example-reporting.net"]
+      },
+
+      "dkim_policy": {
+        "evaluation_mode": "all_ok",
+        "expected_txt": {
+          "s1": "v=DKIM1; k=rsa; p=MIIBFAKEKEYS1MIIBFAKEKEYS1MIIBFAKEKEYS1MIIBFAKEKEYS1MIIBFAKEKEYS1AB",
+          "s2": "v=DKIM1; k=rsa; p=MIIBFAKEKEYS2MIIBFAKEKEYS2MIIBFAKEKEYS2MIIBFAKEKEYS2MIIBFAKEKEYS2AB"
         }
+      },
+
+      "bimi_policy": {
+        "allowed_logo_domains": [
+          "assets.example.ch",
+          "static.example-ag.ch"
+        ]
+      },
+
+      "dane_policy": {
+        "min_tls_version": "1.2"
       }
+    },
+
+    "minimal": {
+      "description": "Minimales Profil fuer Basis-Audit (nur MX, SPF, DKIM, DMARC)",
+
+      "match": {
+        "domains": ["example.ch", "example-ag.ch"]
+      },
+
+      "require_mx": true,
+      "require_spf": true,
+      "require_dkim": true,
+      "require_dmarc": true,
+
+      "require_arc": false,
+      "require_dane": false,
+      "require_mta_sts": false,
+      "require_tls_rpt": false,
+      "require_bimi": false,
+
+      "dmarc_strict_alignment": false,
+      "dmarc_ok_policies": ["quarantine", "reject"],
+
+      "dkim_selectors": ["s1"]
     }
   },
 
+  "dns": {
+    "timeout": 10,
+    "udp_timeout": 10,
+    "tcp_timeout": 10,
+    "retrans": 2,
+    "retry": 2,
+    "dnssec": 0,
+    "edns_udp_size": 1232,
+    "servers": ["1.1.1.1", "8.8.8.8"]
+  },
+
   "output": {
-    "log_file": "/var/log/script/domain_dns_audit.log",
-    "json_file": "/var/log/script/domain_dns_audit.json",
+    "log_file": "/opt/domain_dns_audit/log/domain_dns_audit.log",
+    "json_file": "/opt/domain_dns_audit/script/json/domain_dns_audit.json",
     "log_level": "INFO"
+  },
+
+  "runtime": {
+    "max_procs": 10
   }
 }
